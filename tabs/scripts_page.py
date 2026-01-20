@@ -21,7 +21,7 @@ from widgets import (
 )
 from db import (
     get_schedules, save_schedule, delete_schedule, update_schedule,
-    get_groups_for_profiles, get_contents, get_category_contents
+    get_groups_for_profiles, get_contents
 )
 from api_service import api
 from automation.window_manager import acquire_window_slot, release_window_slot, get_window_bounds
