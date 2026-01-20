@@ -1,10 +1,14 @@
 """
 Reels Page - Đăng Reels lên Fanpage
 PySide6 version - BEAUTIFUL UI like ProfilesPage
+CDP automation thật cho upload video
 """
 import threading
 import os
-from typing import List, Dict
+import re
+import time
+import random
+from typing import List, Dict, Optional
 from datetime import datetime
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
@@ -24,6 +28,20 @@ from db import (
     get_reel_schedules, save_reel_schedule, delete_reel_schedule,
     get_posted_reels, save_posted_reel, get_posted_reels_count
 )
+
+# CDP imports
+import requests
+import json as json_module
+
+try:
+    from automation.window_manager import acquire_window_slot, release_window_slot, get_window_bounds
+    from automation.cdp_helper import CDPHelper
+    CDP_AVAILABLE = True
+except ImportError:
+    CDP_AVAILABLE = False
+    def acquire_window_slot(): return 0
+    def release_window_slot(slot_id): pass
+    CDPHelper = None
 
 
 class ReelsSignal(QObject):
@@ -52,6 +70,7 @@ class ReelsPage(QWidget):
 
         # Running state
         self._is_posting = False
+        self._stop_requested = False
 
         # Signal để thread-safe UI update
         self.signal = ReelsSignal()
@@ -519,7 +538,7 @@ class ReelsPage(QWidget):
         return True
 
     def _post_reel_now(self):
-        """Dang Reel ngay"""
+        """Đăng Reel ngay - sử dụng CDP automation thật"""
         if not self._validate_inputs():
             return
 
@@ -527,38 +546,404 @@ class ReelsPage(QWidget):
             QMessageBox.warning(self, "Thông báo", "Đang trong quá trình đăng...")
             return
 
+        if not CDP_AVAILABLE:
+            QMessageBox.warning(self, "Lỗi", "Chưa có module CDP automation!")
+            return
+
         self._is_posting = True
-        self.log("Bắt đầu đăng Reel...", "info")
-        self.progress_label.setText("Đang xử lý...")
+        self._stop_requested = False
+        self.log("Bắt đầu đăng Reel qua CDP...", "info")
+        self.progress_label.setText("Đang mở browser...")
 
         page_idx = self.page_combo.currentIndex()
         page = self.pages[page_idx - 1] if page_idx > 0 else {}
 
+        caption = self.caption_text.toPlainText().strip()
+        hashtags = self.hashtag_input.text().strip()
+
         def do_post():
-            import time
-            time.sleep(2)  # Simulate posting
-
-            # Save to history
-            save_posted_reel({
-                'profile_uuid': self.selected_profile_uuid,
-                'page_id': page.get('page_id', ''),
-                'page_name': page.get('page_name', ''),
-                'video_path': self.video_path,
-                'caption': self.caption_text.toPlainText(),
-                'hashtags': self.hashtag_input.text(),
-                'status': 'success'
-            })
-
-            QTimer.singleShot(0, lambda: self._on_post_complete(True))
+            try:
+                reel_url = self._post_reel_to_page(page, caption, hashtags)
+                QTimer.singleShot(0, lambda: self._on_post_complete(True, reel_url))
+            except Exception as e:
+                print(f"[ReelsPage] Error: {e}")
+                import traceback
+                traceback.print_exc()
+                self.signal.log_message.emit(f"Lỗi: {str(e)}", "error")
+                QTimer.singleShot(0, lambda: self._on_post_complete(False))
 
         threading.Thread(target=do_post, daemon=True).start()
 
-    def _on_post_complete(self, success):
+    def _open_browser_with_cdp(self, profile_uuid: str, max_retries: int = 2):
+        """Mở browser và kết nối CDP với logic retry"""
+        for attempt in range(max_retries):
+            print(f"[ReelsPage] Opening browser (attempt {attempt + 1}/{max_retries})...")
+            result = api.open_browser(profile_uuid)
+
+            status = result.get('status') or result.get('type')
+            if status not in ['successfully', 'success', True]:
+                if 'already' not in str(result).lower() and 'running' not in str(result).lower():
+                    if attempt < max_retries - 1:
+                        time.sleep(3)
+                        continue
+                    raise Exception(f"Không mở được browser: {result}")
+
+            data = result.get('data', {})
+            remote_port = data.get('remote_port')
+            ws_url = data.get('web_socket', '')
+
+            if not remote_port:
+                match = re.search(r':(\d+)/', ws_url)
+                if match:
+                    remote_port = int(match.group(1))
+
+            if not remote_port:
+                raise Exception("Không lấy được remote debugging port")
+
+            print(f"[ReelsPage] Browser opened, port: {remote_port}")
+            time.sleep(3)
+
+            # Thử kết nối CDP
+            cdp_base = f"http://127.0.0.1:{remote_port}"
+            cdp_connected = False
+            tabs = None
+
+            for cdp_attempt in range(5):
+                try:
+                    resp = requests.get(f"{cdp_base}/json", timeout=10)
+                    tabs = resp.json()
+                    cdp_connected = True
+                    break
+                except Exception as e:
+                    print(f"[ReelsPage] CDP retry {cdp_attempt + 1}/5: {e}")
+                    time.sleep(2)
+
+            if cdp_connected and tabs:
+                print(f"[ReelsPage] CDP connected!")
+                return remote_port, tabs
+
+            # CDP fail - đóng browser và thử lại
+            if attempt < max_retries - 1:
+                print(f"[ReelsPage] CDP failed, retrying...")
+                try:
+                    api.close_browser(profile_uuid)
+                    time.sleep(3)
+                except:
+                    pass
+
+        raise Exception("Không kết nối được CDP")
+
+    def _post_reel_to_page(self, page: Dict, caption: str, hashtags: str) -> Optional[str]:
+        """Đăng Reels lên một Page qua CDPHelper - CDP automation thật"""
+        profile_uuid = page.get('profile_uuid') or self.selected_profile_uuid
+        page_id = page.get('page_id', '')
+        page_name = page.get('page_name', 'Unknown')
+        page_url = page.get('page_url', f"https://www.facebook.com/{page_id}")
+
+        print(f"[ReelsPage] Đang đăng Reels lên {page_name}...")
+        print(f"[ReelsPage] Video: {self.video_path}")
+        print(f"[ReelsPage] Caption: {caption[:50] if caption else 'N/A'}...")
+
+        slot_id = acquire_window_slot()
+        cdp = None
+
+        try:
+            # Bước 1: Mở browser và kết nối CDP
+            remote_port, tabs = self._open_browser_with_cdp(profile_uuid)
+
+            # Tìm WebSocket URL
+            page_ws = None
+            for tab in tabs:
+                if tab.get('type') == 'page':
+                    ws_url = tab.get('webSocketDebuggerUrl', '')
+                    if ws_url:
+                        page_ws = ws_url
+                        break
+
+            if not page_ws:
+                raise Exception("Không tìm thấy tab Facebook")
+
+            # Bước 2: Kết nối CDPHelper
+            cdp = CDPHelper()
+            if not cdp.connect(remote_port=remote_port, ws_url=page_ws):
+                raise Exception("Không kết nối được CDPHelper")
+
+            print(f"[ReelsPage] CDPHelper connected!")
+            QTimer.singleShot(0, lambda: self.progress_label.setText("Đang vào trang..."))
+
+            # Bước 3: Navigate đến page
+            print(f"[ReelsPage] Navigating to page: {page_url}")
+            cdp.navigate(page_url)
+            cdp.wait_for_page_load()
+            time.sleep(3)
+
+            # Click "Chuyển ngay" nếu có
+            js_click_switch = '''
+            (function() {
+                var buttons = document.querySelectorAll('div[role="button"], span[role="button"]');
+                for (var i = 0; i < buttons.length; i++) {
+                    var btn = buttons[i];
+                    var ariaLabel = btn.getAttribute('aria-label') || '';
+                    var text = (btn.innerText || '').trim();
+                    if (ariaLabel === 'Chuyển ngay' || text === 'Chuyển ngay' ||
+                        ariaLabel === 'Switch now' || text === 'Switch now') {
+                        btn.click();
+                        return 'clicked_switch';
+                    }
+                }
+                return 'no_switch';
+            })();
+            '''
+            switch_result = cdp.execute_js(js_click_switch)
+            print(f"[ReelsPage] Switch result: {switch_result}")
+            if 'clicked' in str(switch_result):
+                time.sleep(3)
+
+            # Bước 4: Navigate đến Reels creator
+            QTimer.singleShot(0, lambda: self.progress_label.setText("Đang vào trang tạo Reel..."))
+            reels_create_url = "https://www.facebook.com/reels/create"
+            print(f"[ReelsPage] Navigating to Reels creator: {reels_create_url}")
+            cdp.navigate(reels_create_url)
+            cdp.wait_for_page_load(timeout_ms=20000)
+            time.sleep(3)
+
+            # Bước 5: Upload video
+            QTimer.singleShot(0, lambda: self.progress_label.setText("Đang upload video..."))
+            print(f"[ReelsPage] Preparing to upload video...")
+            video_path = self.video_path.replace('\\', '/')
+
+            # Click vào vùng upload
+            js_click_upload = '''
+            (function() {
+                var uploadSelectors = [
+                    '[aria-label*="video"]', '[aria-label*="Tải"]', '[aria-label*="Upload"]',
+                    '[aria-label*="Thêm video"]', '[aria-label*="Add video"]'
+                ];
+                for (var i = 0; i < uploadSelectors.length; i++) {
+                    try {
+                        var el = document.querySelector(uploadSelectors[i]);
+                        if (el) {
+                            var btn = el.closest('[role="button"]') || el;
+                            if (btn && btn.click) {
+                                btn.click();
+                                return 'clicked: ' + uploadSelectors[i];
+                            }
+                        }
+                    } catch(e) {}
+                }
+                return 'no_upload_area';
+            })();
+            '''
+            cdp.execute_js(js_click_upload)
+            time.sleep(2)
+
+            # Upload file sử dụng CDPHelper
+            selectors_to_try = [
+                'input[type="file"][accept*="video"]',
+                'input[type="file"][accept*="mp4"]',
+                'input[type="file"]'
+            ]
+
+            uploaded = False
+            for selector in selectors_to_try:
+                try:
+                    if cdp.upload_file(selector, video_path):
+                        print(f"[ReelsPage] Video uploaded via: {selector}")
+                        uploaded = True
+                        break
+                except Exception as e:
+                    print(f"[ReelsPage] Upload error with {selector}: {e}")
+                    continue
+
+            if not uploaded:
+                raise Exception("Không upload được video")
+
+            # Đợi video xử lý
+            QTimer.singleShot(0, lambda: self.progress_label.setText("Đang xử lý video..."))
+            print(f"[ReelsPage] Waiting for video processing...")
+            time.sleep(15)
+
+            # Bước 6: Click nút "Tiếp"
+            js_click_next = '''
+            (function() {
+                var spans = document.querySelectorAll('span');
+                for (var i = 0; i < spans.length; i++) {
+                    var text = (spans[i].innerText || '').trim();
+                    if (text === 'Tiếp' || text === 'Next') {
+                        var clickable = spans[i].closest('div[role="none"]') ||
+                                       spans[i].closest('div[role="button"]') ||
+                                       spans[i].parentElement.parentElement;
+                        if (clickable && clickable.offsetParent !== null) {
+                            clickable.click();
+                            return 'clicked: ' + text;
+                        }
+                    }
+                }
+                return 'no_next_button';
+            })();
+            '''
+
+            print(f"[ReelsPage] Looking for 'Tiếp' button...")
+            next_result = cdp.execute_js(js_click_next)
+            print(f"[ReelsPage] First 'Tiếp': {next_result}")
+            if 'clicked' in str(next_result):
+                time.sleep(5)
+
+            next_result2 = cdp.execute_js(js_click_next)
+            print(f"[ReelsPage] Second 'Tiếp': {next_result2}")
+            if 'clicked' in str(next_result2):
+                time.sleep(5)
+
+            # Bước 7: Nhập caption
+            full_caption = f"{caption}\n\n{hashtags}" if hashtags else caption
+            QTimer.singleShot(0, lambda: self.progress_label.setText("Đang nhập caption..."))
+
+            if full_caption:
+                print(f"[ReelsPage] Adding caption...")
+                js_focus_caption = '''
+                (function() {
+                    var editors = document.querySelectorAll('[contenteditable="true"][data-lexical-editor="true"]');
+                    for (var i = 0; i < editors.length; i++) {
+                        var ed = editors[i];
+                        var placeholder = (ed.getAttribute('aria-placeholder') || '').toLowerCase();
+                        if (placeholder.includes('mô tả') || placeholder.includes('thước phim') || placeholder.includes('description')) {
+                            ed.click();
+                            ed.focus();
+                            return 'focused';
+                        }
+                    }
+                    // Fallback
+                    var allEditors = document.querySelectorAll('[contenteditable="true"]');
+                    for (var i = 0; i < allEditors.length; i++) {
+                        var ed = allEditors[i];
+                        var ariaLabel = (ed.getAttribute('aria-label') || '').toLowerCase();
+                        if (!ariaLabel.includes('bình luận') && !ariaLabel.includes('comment')) {
+                            ed.click();
+                            ed.focus();
+                            return 'fallback_editor';
+                        }
+                    }
+                    return 'no_editor';
+                })();
+                '''
+                cdp.execute_js(js_focus_caption)
+                time.sleep(0.5)
+
+                # Gõ caption
+                cdp.type_human_like(full_caption)
+                time.sleep(2)
+
+            # Bước 8: Click nút đăng
+            QTimer.singleShot(0, lambda: self.progress_label.setText("Đang đăng Reel..."))
+            print(f"[ReelsPage] Looking for 'Đăng' button...")
+            js_click_post = '''
+            (function() {
+                var spans = document.querySelectorAll('span');
+                for (var i = 0; i < spans.length; i++) {
+                    var text = (spans[i].innerText || '').trim();
+                    if (text === 'Đăng' || text === 'Share' || text === 'Post') {
+                        var clickable = spans[i].closest('div[role="none"]') ||
+                                       spans[i].closest('div[role="button"]') ||
+                                       spans[i].parentElement.parentElement;
+                        if (clickable && clickable.offsetParent !== null) {
+                            clickable.click();
+                            return 'clicked: ' + text;
+                        }
+                    }
+                }
+                return 'no_post_button';
+            })();
+            '''
+            click_result = cdp.execute_js(js_click_post)
+            print(f"[ReelsPage] Post button: {click_result}")
+
+            if 'no_post_button' in str(click_result):
+                raise Exception("Không tìm thấy nút đăng")
+
+            # Đợi đăng xong
+            print(f"[ReelsPage] Waiting for Reel to be posted...")
+            time.sleep(15)
+
+            # Bước 9: Tìm URL của Reel vừa đăng
+            js_get_reel_url = '''
+            (function() {
+                var links = document.querySelectorAll('a');
+                for (var i = 0; i < links.length; i++) {
+                    var href = links[i].href || '';
+                    if (href.includes('/reel/')) {
+                        var match = href.match(/\\/reel\\/(\\d{10,})/);
+                        if (match) {
+                            return 'https://www.facebook.com/reel/' + match[1];
+                        }
+                    }
+                }
+                return '';
+            })();
+            '''
+
+            reel_url = None
+            for attempt in range(10):
+                result = cdp.execute_js(js_get_reel_url)
+                if result and 'facebook.com/reel/' in str(result):
+                    reel_url = result
+                    break
+                time.sleep(2)
+
+            # Lưu vào database
+            save_posted_reel({
+                'profile_uuid': profile_uuid,
+                'page_id': page_id,
+                'page_name': page_name,
+                'reel_url': reel_url or '',
+                'caption': caption,
+                'hashtags': hashtags,
+                'video_path': self.video_path,
+                'status': 'success'
+            })
+
+            print(f"[ReelsPage] SUCCESS - Đã đăng Reels lên {page_name}")
+            if reel_url:
+                print(f"[ReelsPage] REEL URL: {reel_url}")
+
+            return reel_url
+
+        except Exception as e:
+            print(f"[ReelsPage] ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # Lưu lỗi vào DB
+            try:
+                save_posted_reel({
+                    'profile_uuid': profile_uuid,
+                    'page_id': page_id,
+                    'page_name': page_name,
+                    'reel_url': '',
+                    'caption': caption,
+                    'hashtags': hashtags,
+                    'video_path': self.video_path,
+                    'status': 'failed',
+                    'error_message': str(e)
+                })
+            except:
+                pass
+            raise e
+
+        finally:
+            if cdp:
+                cdp.close()
+            release_window_slot(slot_id)
+
+    def _on_post_complete(self, success, reel_url=None):
         self._is_posting = False
 
         if success:
-            self.progress_label.setText("Đã đăng thành công!")
-            self.log("Reel đã được đăng!", "success")
+            if reel_url:
+                self.progress_label.setText(f"Đã đăng thành công!")
+                self.log(f"Reel đã được đăng: {reel_url[:50]}...", "success")
+            else:
+                self.progress_label.setText("Đã đăng thành công!")
+                self.log("Reel đã được đăng!", "success")
             self._load_history()
 
             # Clear form

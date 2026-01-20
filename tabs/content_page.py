@@ -1,9 +1,12 @@
 """
 Content Page - Quản lý nội dung đăng bài
 PySide6 version - BEAUTIFUL UI
+Có hỗ trợ Import/Export và macro processing
 """
 import threading
+import random
 from typing import List, Dict
+from datetime import datetime
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
     QScrollArea, QMessageBox, QTextEdit, QFileDialog,
@@ -63,6 +66,17 @@ class ContentPage(QWidget):
         self.stat_selected = CyberStatCard("ĐÃ CHỌN", "0", "✓", "mint")
         self.stat_selected.setFixedWidth(160)
         top_bar.addWidget(self.stat_selected)
+
+        # Import/Export buttons
+        btn_import = CyberButton("📥 Nạp", "secondary")
+        btn_import.setFixedWidth(80)
+        btn_import.clicked.connect(self._import_contents)
+        top_bar.addWidget(btn_import)
+
+        btn_export = CyberButton("📤 Xuất", "secondary")
+        btn_export.setFixedWidth(80)
+        btn_export.clicked.connect(self._export_contents)
+        top_bar.addWidget(btn_export)
 
         layout.addLayout(top_bar)
 
@@ -687,3 +701,102 @@ class ContentPage(QWidget):
                 if self.content_checkboxes[content_id].isChecked():
                     selected.append(content)
         return selected
+
+    def _import_contents(self):
+        """Import contents từ file TXT"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Nạp nội dung",
+            "", "Text files (*.txt);;All files (*.*)"
+        )
+
+        if not path:
+            return
+
+        if not self.current_category_id:
+            QMessageBox.warning(self, "Thông báo", "Vui lòng chọn danh mục trước!")
+            return
+
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+            count = 0
+            for line in lines:
+                line = line.strip()
+                if line:
+                    save_content({
+                        'title': f"Imported {count + 1}",
+                        'content': line,
+                        'category_id': self.current_category_id
+                    })
+                    count += 1
+
+            self._load_contents()
+            self._render_categories()
+            self.log(f"Đã nạp {count} nội dung từ file", "success")
+            QMessageBox.information(self, "Thành công", f"Đã nạp {count} nội dung!")
+
+        except Exception as e:
+            self.log(f"Lỗi nạp file: {e}", "error")
+            QMessageBox.warning(self, "Lỗi", f"Không thể nạp file: {e}")
+
+    def _export_contents(self):
+        """Export contents ra file TXT"""
+        if not self.contents:
+            QMessageBox.warning(self, "Thông báo", "Không có nội dung để xuất!")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Xuất nội dung",
+            "contents.txt", "Text files (*.txt)"
+        )
+
+        if not path:
+            return
+
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                for content in self.contents:
+                    title = content.get('title', '')
+                    body = content.get('content', '')
+                    f.write(f"=== {title} ===\n")
+                    f.write(f"{body}\n")
+                    f.write("-" * 50 + "\n\n")
+
+            self.log(f"Đã xuất {len(self.contents)} nội dung", "success")
+            QMessageBox.information(self, "Thành công", f"Đã xuất {len(self.contents)} nội dung ra {path}")
+
+        except Exception as e:
+            self.log(f"Lỗi xuất file: {e}", "error")
+            QMessageBox.warning(self, "Lỗi", f"Không thể xuất file: {e}")
+
+    def process_macros(self, content: str) -> str:
+        """Xử lý macro trong nội dung
+        {r} - Random một dòng từ danh sách
+        {rrr} - Shuffle và nối tất cả các dòng
+        {time} - Thời gian hiện tại
+        {date} - Ngày hiện tại
+        """
+        if not content:
+            return content
+
+        # {r} - Random một dòng
+        if content.startswith('{r}'):
+            lines = content[3:].strip().split('\n')
+            lines = [l.strip() for l in lines if l.strip()]
+            if lines:
+                return random.choice(lines)
+
+        # {rrr} - Shuffle và nối
+        if content.startswith('{rrr}'):
+            lines = content[5:].strip().split('\n')
+            lines = [l.strip() for l in lines if l.strip()]
+            random.shuffle(lines)
+            return '\n'.join(lines)
+
+        # Thay thế macros đơn giản
+        content = content.replace('{time}', datetime.now().strftime('%H:%M:%S'))
+        content = content.replace('{date}', datetime.now().strftime('%d/%m/%Y'))
+        content = content.replace('{datetime}', datetime.now().strftime('%d/%m/%Y %H:%M'))
+
+        return content

@@ -1,6 +1,7 @@
 """
 Groups Page - Đăng nhóm Facebook
 PySide6 version với 3 TABS: Quét nhóm, Đăng nhóm, Đẩy tin
+HỖ TRỢ: Multi-profile posting, Parallel scanning với ThreadPoolExecutor
 """
 import threading
 import random
@@ -8,6 +9,7 @@ import time
 import os
 from typing import List, Dict, Optional
 from datetime import datetime, date, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
     QMessageBox, QProgressBar, QTableWidgetItem, QSpinBox,
@@ -81,6 +83,11 @@ class GroupsPage(QWidget):
         self.scan_group_checkboxes: Dict[int, CyberCheckBox] = {}
         self.post_group_checkboxes: Dict[int, CyberCheckBox] = {}
         self.boost_checkboxes: Dict[int, CyberCheckBox] = {}
+
+        # Multi-profile support
+        self.profile_groups: Dict[str, List[Dict]] = {}  # profile_uuid -> groups
+        self._scan_completed_count = 0
+        self._multi_profile_mode = False
 
         # State
         self._is_scanning = False
@@ -975,7 +982,7 @@ class GroupsPage(QWidget):
             self.scan_table.setItem(row, 5, QTableWidgetItem(scan_date))
 
     def _scan_groups(self):
-        """Start scanning groups - MỞ BROWSER THẬT VÀ QUÉT"""
+        """Start scanning groups - PARALLEL SCANNING với ThreadPoolExecutor"""
         if not self.selected_profile_uuids:
             QMessageBox.warning(self, "Thông báo", "Vui lòng chọn profile trước!")
             return
@@ -986,29 +993,60 @@ class GroupsPage(QWidget):
 
         self._is_scanning = True
         self._stop_requested = False
+        self._scan_completed_count = 0
         self.btn_scan.setEnabled(False)
         self.btn_stop_scan.setEnabled(True)
-        self.log("Bắt đầu quét nhóm - đang mở browser...", "info")
+        self.log("Bắt đầu quét nhóm song song...", "info")
 
-        def scan():
+        profiles_to_scan = list(self.selected_profile_uuids)
+
+        def do_parallel_scan():
+            """Quét song song nhiều profiles với ThreadPoolExecutor"""
             try:
                 all_groups = []
-                total = len(self.selected_profile_uuids)
+                total = len(profiles_to_scan)
 
-                for i, profile_uuid in enumerate(self.selected_profile_uuids):
-                    if self._stop_requested:
-                        break
+                def scan_single_profile(profile_uuid: str) -> List[Dict]:
+                    """Quét 1 profile"""
+                    try:
+                        return self._execute_group_scan_for_profile(profile_uuid)
+                    except Exception as e:
+                        print(f"[ERROR] Scan profile {profile_uuid}: {e}")
+                        return []
 
-                    self.signal.log_message.emit(f"Quét profile {i+1}/{total}...", "info")
+                # Chạy song song (max 3 browser cùng lúc để tránh quá tải)
+                max_workers = min(total, 3)
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_uuid = {
+                        executor.submit(scan_single_profile, uuid): uuid
+                        for uuid in profiles_to_scan
+                    }
 
-                    # Quét nhóm cho profile này
-                    groups = self._execute_group_scan_for_profile(profile_uuid)
-                    all_groups.extend(groups)
+                    for future in as_completed(future_to_uuid):
+                        if self._stop_requested:
+                            break
 
-                    self.signal.scan_progress.emit(i + 1, total)
+                        uuid = future_to_uuid[future]
+                        try:
+                            result = future.result()
+                            all_groups.extend(result)
+
+                            # Lưu vào profile_groups
+                            self.profile_groups[uuid] = result
+
+                            self._scan_completed_count += 1
+                            self.signal.scan_progress.emit(self._scan_completed_count, total)
+
+                            profile_name = next((p.get('name', 'Unknown')[:20] for p in self.profiles if p.get('uuid') == uuid), 'Unknown')
+                            self.signal.log_message.emit(
+                                f"[{self._scan_completed_count}/{total}] {profile_name}: {len(result)} nhóm",
+                                "success"
+                            )
+                        except Exception as e:
+                            print(f"[ERROR] Scan {uuid}: {e}")
 
                 self.signal.scan_complete.emit()
-                self.signal.log_message.emit(f"Quét xong! Tìm thấy {len(all_groups)} nhóm", "success")
+                self.signal.log_message.emit(f"Quét xong! Tìm thấy {len(all_groups)} nhóm từ {total} profiles", "success")
 
             except Exception as e:
                 import traceback
@@ -1016,7 +1054,7 @@ class GroupsPage(QWidget):
                 self.signal.log_message.emit(f"Lỗi quét: {str(e)}", "error")
                 self.signal.scan_complete.emit()
 
-        threading.Thread(target=scan, daemon=True).start()
+        threading.Thread(target=do_parallel_scan, daemon=True).start()
 
     def _execute_group_scan_for_profile(self, profile_uuid: str):
         """Quét nhóm cho 1 profile - GIỐNG CODE GỐC"""
@@ -1337,7 +1375,7 @@ class GroupsPage(QWidget):
             self.img_count_label.setText(f"(Tổng: {count} ảnh)")
 
     def _start_posting(self):
-        """Start posting to groups - MỞ BROWSER VÀ ĐĂNG THẬT"""
+        """Start posting to groups - HỖ TRỢ MULTI-PROFILE"""
         selected_groups = [g for g in self.groups if g.get('id') in self.post_group_checkboxes
                           and self.post_group_checkboxes[g.get('id')].isChecked()]
 
@@ -1355,131 +1393,377 @@ class GroupsPage(QWidget):
             QMessageBox.warning(self, "Thông báo", "Vui lòng chọn nội dung để đăng!")
             return
 
+        # Xây dựng posting tasks - hỗ trợ multi-profile
+        posting_tasks = []
+        selected_group_ids = set(g.get('id') for g in selected_groups)
+
+        if self._multi_profile_mode and self.profile_groups:
+            # Multi-profile mode: mỗi profile đăng vào groups của nó
+            for profile_uuid in self.selected_profile_uuids:
+                profile_all_groups = self.profile_groups.get(profile_uuid, [])
+                profile_selected_groups = [g for g in profile_all_groups if g.get('id') in selected_group_ids]
+                if profile_selected_groups:
+                    posting_tasks.append((profile_uuid, profile_selected_groups))
+        else:
+            # Single profile mode
+            posting_tasks.append((self.selected_profile_uuids[0], selected_groups))
+
+        if not posting_tasks:
+            QMessageBox.warning(self, "Thông báo", "Không có nhóm nào để đăng!")
+            return
+
+        total_groups = sum(len(groups) for _, groups in posting_tasks)
         self._is_posting = True
         self._stop_requested = False
         self.btn_post.setEnabled(False)
         self.btn_stop_post.setEnabled(True)
-        self.log(f"Bắt đầu đăng vào {len(selected_groups)} nhóm...", "info")
+        self.log(f"Bắt đầu đăng vào {total_groups} nhóm từ {len(posting_tasks)} profile...", "info")
 
-        def post():
-            try:
-                profile_uuid = self.selected_profile_uuids[0]
-                slot_id = acquire_window_slot()
+        def execute_all_posting():
+            """Thực hiện posting cho tất cả profiles"""
+            completed_count = 0
 
-                # Mở browser
-                self.signal.log_message.emit(f"Mở browser...", "info")
-                result = api.open_browser(profile_uuid)
+            for profile_uuid, groups in posting_tasks:
+                if self._stop_requested:
+                    break
 
-                status = result.get('status') or result.get('type')
-                if status not in ['successfully', 'success', True]:
-                    if 'already' not in str(result).lower():
-                        self.signal.log_message.emit(f"Không mở được browser", "error")
-                        release_window_slot(slot_id)
-                        self.signal.post_complete.emit()
-                        return
+                profile_name = next((p.get('name', 'Unknown')[:20] for p in self.profiles if p.get('uuid') == profile_uuid), 'Unknown')
+                self.signal.log_message.emit(f"Đang đăng với profile: {profile_name}", "info")
 
-                # Lấy CDP port
-                data = result.get('data', {})
-                remote_port = data.get('remote_port')
-                ws_url = data.get('web_socket', '')
-
-                if not remote_port:
-                    match = re.search(r':(\d+)/', ws_url)
-                    if match:
-                        remote_port = int(match.group(1))
-
-                if not remote_port:
-                    self.signal.log_message.emit("Không lấy được CDP port", "error")
-                    release_window_slot(slot_id)
-                    self.signal.post_complete.emit()
-                    return
-
-                cdp_base = f"http://127.0.0.1:{remote_port}"
-                time.sleep(2)
-
-                # Lấy WebSocket
                 try:
-                    resp = requests.get(f"{cdp_base}/json", timeout=10)
-                    tabs = resp.json()
+                    self._execute_posting_for_profile(profile_uuid, groups, content_to_post, completed_count, total_groups)
+                    completed_count += len(groups)
                 except Exception as e:
-                    self.signal.log_message.emit(f"Lỗi CDP: {e}", "error")
-                    release_window_slot(slot_id)
-                    self.signal.post_complete.emit()
-                    return
+                    import traceback
+                    traceback.print_exc()
+                    self.signal.log_message.emit(f"Lỗi với profile {profile_name}: {e}", "error")
 
-                page_ws = None
-                for tab in tabs:
-                    if tab.get('type') == 'page':
-                        page_ws = tab.get('webSocketDebuggerUrl')
-                        break
+            self.signal.post_complete.emit()
 
-                if not page_ws:
-                    release_window_slot(slot_id)
-                    self.signal.post_complete.emit()
-                    return
+        threading.Thread(target=execute_all_posting, daemon=True).start()
 
-                try:
-                    ws = websocket.create_connection(page_ws, timeout=30, suppress_origin=True)
-                except:
-                    release_window_slot(slot_id)
-                    self.signal.post_complete.emit()
-                    return
+    def _type_like_human(self, ws, text: str, msg_id: list) -> bool:
+        """Gõ từng ký tự như người thật với typo và pause. Returns True nếu thành công."""
+        # Các ký tự hay bị gõ nhầm (adjacent keys)
+        typo_map = {
+            'a': ['s', 'q', 'z'], 'b': ['v', 'n', 'g'], 'c': ['x', 'v', 'd'],
+            'd': ['s', 'f', 'e'], 'e': ['w', 'r', 'd'], 'f': ['d', 'g', 'r'],
+            'g': ['f', 'h', 't'], 'h': ['g', 'j', 'y'], 'i': ['u', 'o', 'k'],
+            'j': ['h', 'k', 'u'], 'k': ['j', 'l', 'i'], 'l': ['k', 'o', 'p'],
+            'm': ['n', 'k'], 'n': ['b', 'm', 'h'], 'o': ['i', 'p', 'l'],
+            'p': ['o', 'l'], 'q': ['w', 'a'], 'r': ['e', 't', 'f'],
+            's': ['a', 'd', 'w'], 't': ['r', 'y', 'g'], 'u': ['y', 'i', 'j'],
+            'v': ['c', 'b', 'f'], 'w': ['q', 'e', 's'], 'x': ['z', 'c', 's'],
+            'y': ['t', 'u', 'h'], 'z': ['x', 'a']
+        }
 
-                total = len(selected_groups)
-                msg_id = [10]
+        def send_cdp(method, params=None):
+            msg_id[0] += 1
+            msg = {"id": msg_id[0], "method": method}
+            if params:
+                msg["params"] = params
+            try:
+                ws.send(json_module.dumps(msg))
+                return json_module.loads(ws.recv())
+            except:
+                return {"ws_closed": True}
 
-                def send_cdp(method, params=None):
-                    msg_id[0] += 1
-                    msg = {"id": msg_id[0], "method": method}
-                    if params:
-                        msg["params"] = params
-                    ws.send(json_module.dumps(msg))
-                    return json_module.loads(ws.recv())
+        # Chia text thành các đoạn (theo dòng hoặc câu)
+        paragraphs = text.split('\n')
 
-                for i, group in enumerate(selected_groups):
-                    if self._stop_requested:
-                        break
+        for p_idx, paragraph in enumerate(paragraphs):
+            if not paragraph.strip():
+                # Gõ newline
+                result = send_cdp("Input.insertText", {"text": "\n"})
+                if result.get('ws_closed'):
+                    return False
+                time.sleep(random.uniform(0.3, 0.8))
+                continue
 
-                    group_name = group.get('name', 'Unknown')
-                    group_id = group.get('group_id', '')
-                    self.signal.log_message.emit(f"[{i+1}/{total}] Đăng vào: {group_name}", "info")
+            # Chia paragraph thành các câu
+            sentences = paragraph.replace('. ', '.|').replace('! ', '!|').replace('? ', '?|').split('|')
 
-                    # Navigate đến nhóm
-                    group_url = f"https://www.facebook.com/groups/{group_id}"
-                    send_cdp("Page.navigate", {"url": group_url})
-                    time.sleep(5)
+            for s_idx, sentence in enumerate(sentences):
+                for i, char in enumerate(sentence):
+                    # Random typo (3% chance cho chữ thường)
+                    if char.lower() in typo_map and random.random() < 0.03:
+                        # Gõ sai
+                        wrong_char = random.choice(typo_map[char.lower()])
+                        result = send_cdp("Input.insertText", {"text": wrong_char})
+                        if result.get('ws_closed'):
+                            return False
+                        time.sleep(random.uniform(0.05, 0.15))
 
-                    # Lấy nội dung random hoặc cố định
-                    if self.random_content_cb.isChecked() and self.contents:
-                        content = random.choice(self.contents)
-                        post_text = content.get('content', content_to_post)
+                        # Nhận ra sai, dừng lại
+                        time.sleep(random.uniform(0.2, 0.5))
+
+                        # Xóa (Backspace)
+                        result = send_cdp("Input.dispatchKeyEvent", {
+                            "type": "keyDown",
+                            "key": "Backspace",
+                            "code": "Backspace"
+                        })
+                        if result.get('ws_closed'):
+                            return False
+                        result = send_cdp("Input.dispatchKeyEvent", {
+                            "type": "keyUp",
+                            "key": "Backspace",
+                            "code": "Backspace"
+                        })
+                        if result.get('ws_closed'):
+                            return False
+                        time.sleep(random.uniform(0.1, 0.2))
+
+                    # Gõ ký tự đúng
+                    result = send_cdp("Input.insertText", {"text": char})
+                    if result.get('ws_closed'):
+                        return False
+
+                    # Delay khác nhau tùy ký tự
+                    if char in ' .,!?':
+                        # Sau dấu câu chậm hơn
+                        time.sleep(random.uniform(0.08, 0.2))
+                    elif char.isupper():
+                        # Chữ hoa chậm hơn (phải giữ Shift)
+                        time.sleep(random.uniform(0.06, 0.15))
                     else:
-                        post_text = content_to_post
+                        # Chữ thường nhanh hơn
+                        time.sleep(random.uniform(0.03, 0.1))
 
-                    # Click vào ô viết bài - thử nhiều selector
-                    click_script = """
-                    (function() {
-                        // Tìm ô "Viết gì đó..." hoặc "Write something..."
-                        var selectors = [
-                            '[aria-label*="Viết"]',
-                            '[aria-label*="Write"]',
-                            '[data-testid="Composer"]',
-                            '[role="button"][tabindex="0"]'
-                        ];
-                        for (var s of selectors) {
-                            var el = document.querySelector(s);
-                            if (el && el.offsetParent !== null) {
-                                el.click();
-                                return 'clicked';
+                # Pause giữa các câu
+                if s_idx < len(sentences) - 1:
+                    time.sleep(random.uniform(0.3, 0.8))
+
+            # Gõ newline giữa các paragraph
+            if p_idx < len(paragraphs) - 1:
+                result = send_cdp("Input.insertText", {"text": "\n"})
+                if result.get('ws_closed'):
+                    return False
+                # Pause lâu hơn giữa các đoạn
+                time.sleep(random.uniform(0.5, 1.2))
+
+        return True
+
+    def _scroll_page(self, ws, direction: str, amount: int, msg_id: list):
+        """Cuộn trang như người thật"""
+        scroll_script = f"window.scrollBy(0, {amount if direction == 'down' else -amount});"
+        msg_id[0] += 1
+        ws.send(json_module.dumps({
+            "id": msg_id[0],
+            "method": "Runtime.evaluate",
+            "params": {"expression": scroll_script}
+        }))
+        try:
+            ws.recv()
+        except:
+            pass
+
+    def _execute_posting_for_profile(self, profile_uuid: str, groups: List[Dict], content_to_post: str, completed_offset: int, total_groups: int):
+        """Thực hiện posting cho 1 profile"""
+        slot_id = acquire_window_slot()
+
+        try:
+            # Mở browser
+            self.signal.log_message.emit(f"Mở browser...", "info")
+            result = api.open_browser(profile_uuid)
+
+            status = result.get('status') or result.get('type')
+            if status not in ['successfully', 'success', True]:
+                if 'already' not in str(result).lower():
+                    raise Exception(f"Không mở được browser: {result}")
+
+            # Lấy CDP port
+            data = result.get('data', {})
+            remote_port = data.get('remote_port')
+            ws_url = data.get('web_socket', '')
+
+            if not remote_port:
+                match = re.search(r':(\d+)/', ws_url)
+                if match:
+                    remote_port = int(match.group(1))
+
+            if not remote_port:
+                raise Exception("Không lấy được CDP port")
+
+            cdp_base = f"http://127.0.0.1:{remote_port}"
+            time.sleep(2)
+
+            # Lấy WebSocket
+            resp = requests.get(f"{cdp_base}/json", timeout=10)
+            tabs = resp.json()
+
+            page_ws = None
+            for tab in tabs:
+                if tab.get('type') == 'page':
+                    page_ws = tab.get('webSocketDebuggerUrl')
+                    break
+
+            if not page_ws:
+                raise Exception("Không tìm thấy WebSocket")
+
+            ws = websocket.create_connection(page_ws, timeout=30, suppress_origin=True)
+            msg_id = [10]
+
+            def send_cdp(method, params=None):
+                msg_id[0] += 1
+                msg = {"id": msg_id[0], "method": method}
+                if params:
+                    msg["params"] = params
+                ws.send(json_module.dumps(msg))
+                return json_module.loads(ws.recv())
+
+            total = len(groups)
+
+            for i, group in enumerate(groups):
+                if self._stop_requested:
+                    break
+
+                group_name = group.get('group_name') or group.get('name', 'Unknown')
+                group_id = group.get('group_id', '')
+                self.signal.log_message.emit(f"[{completed_offset + i + 1}/{total_groups}] Đăng vào: {group_name[:30]}", "info")
+
+                # Navigate đến nhóm
+                group_url = f"https://www.facebook.com/groups/{group_id}"
+                send_cdp("Page.navigate", {"url": group_url})
+                time.sleep(random.uniform(4, 6))
+
+                # Đợi page load
+                for _ in range(10):
+                    result = send_cdp("Runtime.evaluate", {"expression": "document.readyState"})
+                    if result.get('result', {}).get('result', {}).get('value') == 'complete':
+                        break
+                    time.sleep(1)
+                time.sleep(random.uniform(1, 2))
+
+                # Scroll xuống một chút như người thật đọc trang
+                if random.random() < 0.7:
+                    self._scroll_page(ws, "down", random.randint(100, 300), msg_id)
+                    time.sleep(random.uniform(0.5, 1.5))
+                    self._scroll_page(ws, "up", random.randint(50, 150), msg_id)
+                    time.sleep(random.uniform(0.3, 0.8))
+
+                # Lấy nội dung random hoặc cố định
+                if self.random_content_cb.isChecked() and self.contents:
+                    content = random.choice(self.contents)
+                    post_text = content.get('content', content_to_post)
+                else:
+                    post_text = content_to_post
+
+                # Click vào ô "Bạn viết gì đi..." - PHÂN BIỆT COMPOSER TẠO BÀI vs Ô COMMENT
+                click_composer_script = '''
+                (function() {
+                    const composerTexts = ['Bạn viết gì đi', 'Write something', 'bạn viết gì đi', 'write something'];
+
+                    function hasComposerText(text) {
+                        if (!text) return false;
+                        let lowerText = text.toLowerCase();
+                        for (let kw of composerTexts) {
+                            if (lowerText.includes(kw.toLowerCase())) return true;
+                        }
+                        return false;
+                    }
+
+                    function isInsideArticle(el) {
+                        let parent = el;
+                        while (parent) {
+                            if (parent.getAttribute && parent.getAttribute('role') === 'article') {
+                                return true;
+                            }
+                            parent = parent.parentElement;
+                        }
+                        return false;
+                    }
+
+                    // Cách 1: Tìm [role="button"][tabindex="0"] với text composer
+                    let btns = document.querySelectorAll('[role="button"][tabindex="0"]');
+                    for (let btn of btns) {
+                        let text = btn.innerText || '';
+                        if (hasComposerText(text) && !isInsideArticle(btn)) {
+                            let rect = btn.getBoundingClientRect();
+                            if (rect.top > 0 && rect.top < 700 && rect.width > 50) {
+                                btn.click();
+                                return {x: rect.left + rect.width/2, y: rect.top + rect.height/2, clicked: true};
                             }
                         }
-                        return 'not_found';
+                    }
+
+                    // Cách 2: Tìm tất cả [role="button"]
+                    let allBtns = document.querySelectorAll('[role="button"]');
+                    for (let btn of allBtns) {
+                        let text = btn.innerText || '';
+                        if (hasComposerText(text) && !isInsideArticle(btn)) {
+                            let rect = btn.getBoundingClientRect();
+                            if (rect.top > 0 && rect.top < 700) {
+                                btn.click();
+                                return {x: rect.left + rect.width/2, y: rect.top + rect.height/2, clicked: true};
+                            }
+                        }
+                    }
+
+                    // Cách 3: Tìm div[tabindex="0"]
+                    let divs = document.querySelectorAll('div[tabindex="0"]');
+                    for (let div of divs) {
+                        let text = div.innerText || '';
+                        if (hasComposerText(text) && !isInsideArticle(div)) {
+                            let rect = div.getBoundingClientRect();
+                            if (rect.top > 0 && rect.top < 700) {
+                                div.click();
+                                return {x: rect.left + rect.width/2, y: rect.top + rect.height/2, clicked: true};
+                            }
+                        }
+                    }
+
+                    // Cách 4: Tìm theo aria-label
+                    let labeled = document.querySelectorAll('[aria-label*="Create a post"], [aria-label*="Tạo bài viết"], [aria-label*="Viết bài"]');
+                    for (let el of labeled) {
+                        if (!isInsideArticle(el)) {
+                            let rect = el.getBoundingClientRect();
+                            if (rect.top > 0 && rect.top < 700) {
+                                el.click();
+                                return {x: rect.left + rect.width/2, y: rect.top + rect.height/2, clicked: true};
+                            }
+                        }
+                    }
+
+                    return {clicked: false};
+                })()
+                '''
+                result = send_cdp("Runtime.evaluate", {"expression": click_composer_script, "returnByValue": True})
+                time.sleep(random.uniform(2, 3))
+
+                # Đợi editor xuất hiện
+                for _ in range(5):
+                    check_result = send_cdp("Runtime.evaluate", {
+                        "expression": "document.querySelector('[contenteditable=\"true\"][role=\"textbox\"]') !== null",
+                        "returnByValue": True
+                    })
+                    if check_result.get('result', {}).get('result', {}).get('value'):
+                        break
+                    time.sleep(1)
+
+                # Focus vào editor
+                send_cdp("Runtime.evaluate", {
+                    "expression": """
+                    (function() {
+                        var editor = document.querySelector('[contenteditable="true"][role="textbox"]');
+                        if (editor) {
+                            editor.focus();
+                            editor.click();
+                            return true;
+                        }
+                        return false;
                     })()
                     """
-                    send_cdp("Runtime.evaluate", {"expression": click_script})
-                    time.sleep(2)
+                })
+                time.sleep(0.5)
 
-                    # Nhập nội dung
+                # Gõ nội dung như người thật
+                use_human_typing = random.random() < 0.6  # 60% dùng human typing
+                if use_human_typing and len(post_text) < 500:
+                    self.signal.log_message.emit("Đang gõ nội dung...", "info")
+                    self._type_like_human(ws, post_text, msg_id)
+                else:
+                    # Dùng insertText nhanh hơn cho text dài
                     type_script = f"""
                     (function() {{
                         var editor = document.querySelector('[contenteditable="true"][role="textbox"]');
@@ -1492,54 +1776,59 @@ class GroupsPage(QWidget):
                     }})()
                     """
                     send_cdp("Runtime.evaluate", {"expression": type_script})
-                    time.sleep(1)
+                time.sleep(random.uniform(1, 2))
 
-                    # Click nút Đăng
-                    post_script = """
-                    (function() {
-                        var btns = document.querySelectorAll('[aria-label*="Đăng"], [aria-label*="Post"], button');
-                        for (var btn of btns) {
-                            var text = btn.textContent || btn.getAttribute('aria-label') || '';
-                            if (text.includes('Đăng') || text.includes('Post')) {
-                                btn.click();
-                                return 'posted';
-                            }
+                # Click nút Đăng
+                post_script = """
+                (function() {
+                    // Tìm nút Đăng trong dialog/popup
+                    var btns = document.querySelectorAll('[aria-label*="Đăng"], [aria-label*="Post"], button, [role="button"]');
+                    for (var btn of btns) {
+                        var text = btn.textContent || btn.getAttribute('aria-label') || '';
+                        var rect = btn.getBoundingClientRect();
+                        // Nút Đăng thường ở góc dưới/phải của popup
+                        if ((text.trim() === 'Đăng' || text.trim() === 'Post') && rect.width > 30) {
+                            btn.click();
+                            return 'posted';
                         }
-                        return 'no_button';
-                    })()
-                    """
-                    result = send_cdp("Runtime.evaluate", {"expression": post_script})
-                    self.signal.log_message.emit(f"✓ Đã đăng vào {group_name}", "success")
+                    }
+                    // Fallback: tìm nút có text chứa Đăng/Post
+                    for (var btn of btns) {
+                        var text = btn.textContent || '';
+                        if (text.includes('Đăng') || text.includes('Post')) {
+                            btn.click();
+                            return 'posted_fallback';
+                        }
+                    }
+                    return 'no_button';
+                })()
+                """
+                send_cdp("Runtime.evaluate", {"expression": post_script})
+                time.sleep(random.uniform(2, 4))  # Đợi đăng xong
+                self.signal.log_message.emit(f"✓ Đã đăng vào {group_name[:25]}", "success")
 
-                    # Lưu lịch sử
-                    save_post_history({
-                        'profile_uuid': profile_uuid,
-                        'group_id': group_id,
-                        'group_name': group_name,
-                        'content': post_text[:200],
-                        'status': 'success',
-                        'posted_at': time.strftime('%Y-%m-%d %H:%M:%S')
-                    })
+                # Lưu lịch sử
+                save_post_history({
+                    'profile_uuid': profile_uuid,
+                    'group_id': group_id,
+                    'group_name': group_name,
+                    'content': post_text[:200],
+                    'status': 'success',
+                    'posted_at': time.strftime('%Y-%m-%d %H:%M:%S')
+                })
 
-                    self.signal.post_progress.emit(i + 1, total)
+                self.signal.post_progress.emit(completed_offset + i + 1, total_groups)
 
-                    # Delay giữa các nhóm
-                    if i < total - 1:
-                        delay = random.randint(5, 15) if self.random_delay_cb.isChecked() else self.delay_spin.value()
-                        self.signal.log_message.emit(f"Đợi {delay}s...", "info")
-                        time.sleep(delay)
+                # Delay giữa các nhóm
+                if i < total - 1:
+                    delay = random.randint(5, 15) if self.random_delay_cb.isChecked() else self.delay_spin.value()
+                    self.signal.log_message.emit(f"Đợi {delay}s...", "info")
+                    time.sleep(delay)
 
-                ws.close()
-                release_window_slot(slot_id)
-                self.signal.post_complete.emit()
+            ws.close()
 
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                self.signal.log_message.emit(f"Lỗi: {str(e)}", "error")
-                self.signal.post_complete.emit()
-
-        threading.Thread(target=post, daemon=True).start()
+        finally:
+            release_window_slot(slot_id)
 
     def _get_content_to_post(self):
         """Lấy nội dung để đăng từ category/content đã chọn"""
@@ -1773,63 +2062,178 @@ class GroupsPage(QWidget):
 
                     self.signal.log_message.emit(f"[{i+1}/{total}] Comment: {group_name}", "info")
 
-                    if post_url:
-                        # Navigate đến bài post
-                        send_cdp("Page.navigate", {"url": post_url})
-                        time.sleep(5)
+                    if post_url and 'facebook.com' in post_url:
+                        # TẠO TAB MỚI để tránh Leave site dialog
+                        try:
+                            result = send_cdp("Target.createTarget", {"url": post_url})
+                            target_id = result.get('result', {}).get('targetId')
 
-                        # Click vào ô bình luận
-                        click_comment_script = """
-                        (function() {
-                            var selectors = [
-                                '[aria-label*="Viết bình luận"]',
-                                '[aria-label*="Write a comment"]',
-                                '[data-testid="UFI2CommentInput"]',
-                                '[placeholder*="Viết"]'
-                            ];
-                            for (var s of selectors) {
-                                var el = document.querySelector(s);
-                                if (el) {
-                                    el.click();
-                                    return 'clicked';
+                            if not target_id:
+                                self.signal.log_message.emit(f"Không tạo được tab mới", "warning")
+                                continue
+
+                            time.sleep(random.uniform(3, 5))
+
+                            # Lấy WebSocket của tab mới
+                            new_ws_url = None
+                            try:
+                                resp = requests.get(f"{cdp_base}/json", timeout=10)
+                                pages = resp.json()
+                                for p in pages:
+                                    if p.get('id') == target_id:
+                                        new_ws_url = p.get('webSocketDebuggerUrl')
+                                        break
+                            except:
+                                pass
+
+                            if not new_ws_url:
+                                send_cdp("Target.closeTarget", {"targetId": target_id})
+                                continue
+
+                            # Kết nối WebSocket tab mới
+                            new_ws = None
+                            try:
+                                new_ws = websocket.create_connection(new_ws_url, timeout=30, suppress_origin=True)
+                            except:
+                                try:
+                                    new_ws = websocket.create_connection(new_ws_url, timeout=30)
+                                except:
+                                    send_cdp("Target.closeTarget", {"targetId": target_id})
+                                    continue
+
+                            new_msg_id = [10]
+
+                            def send_new(method, params=None):
+                                new_msg_id[0] += 1
+                                msg = {"id": new_msg_id[0], "method": method, "params": params or {}}
+                                new_ws.send(json_module.dumps(msg))
+                                try:
+                                    new_ws.settimeout(30)
+                                    resp = new_ws.recv()
+                                    return json_module.loads(resp)
+                                except:
+                                    return {}
+
+                            def eval_new(expr):
+                                result = send_new("Runtime.evaluate", {
+                                    "expression": expr,
+                                    "returnByValue": True,
+                                    "awaitPromise": True
+                                })
+                                return result.get('result', {}).get('result', {}).get('value')
+
+                            # Đợi page load
+                            for _ in range(10):
+                                ready = eval_new("document.readyState")
+                                if ready == 'complete':
+                                    break
+                                time.sleep(1)
+
+                            time.sleep(random.uniform(1, 2))
+
+                            # Scroll xuống một chút để thấy comment box
+                            eval_new("window.scrollBy(0, 300);")
+                            time.sleep(random.uniform(0.5, 1))
+
+                            # Tìm và click vào ô comment
+                            click_comment_js = '''
+                            (function() {
+                                // Tìm ô "Viết bình luận..." hoặc "Write a comment..."
+                                let placeholders = document.querySelectorAll('[contenteditable="true"]');
+                                for (let el of placeholders) {
+                                    let placeholder = el.getAttribute('aria-placeholder') || el.getAttribute('placeholder') || '';
+                                    if (placeholder.includes('bình luận') || placeholder.includes('comment') ||
+                                        placeholder.includes('Viết') || placeholder.includes('Write')) {
+                                        el.focus();
+                                        el.click();
+                                        return true;
+                                    }
                                 }
-                            }
-                            return 'not_found';
-                        })()
-                        """
-                        send_cdp("Runtime.evaluate", {"expression": click_comment_script})
-                        time.sleep(1)
 
-                        # Nhập bình luận
-                        type_comment_script = f"""
-                        (function() {{
-                            var editor = document.querySelector('[contenteditable="true"]');
-                            if (editor) {{
-                                editor.focus();
-                                document.execCommand('insertText', false, {json_module.dumps(comment_text)});
-                                return 'typed';
-                            }}
-                            return 'no_editor';
-                        }})()
-                        """
-                        send_cdp("Runtime.evaluate", {"expression": type_comment_script})
-                        time.sleep(1)
+                                // Fallback: tìm theo aria-label
+                                let commentBox = document.querySelector('[aria-label*="bình luận"]');
+                                if (!commentBox) commentBox = document.querySelector('[aria-label*="comment"]');
+                                if (!commentBox) commentBox = document.querySelector('[aria-label*="Viết"]');
+                                if (commentBox) {
+                                    commentBox.focus();
+                                    commentBox.click();
+                                    return true;
+                                }
 
-                        # Nhấn Enter để gửi
-                        send_cdp("Input.dispatchKeyEvent", {
-                            "type": "keyDown",
-                            "key": "Enter",
-                            "code": "Enter",
-                            "windowsVirtualKeyCode": 13
-                        })
-                        send_cdp("Input.dispatchKeyEvent", {
-                            "type": "keyUp",
-                            "key": "Enter",
-                            "code": "Enter",
-                            "windowsVirtualKeyCode": 13
-                        })
+                                // Fallback 2: click vào text "Viết bình luận"
+                                let spans = document.querySelectorAll('span');
+                                for (let span of spans) {
+                                    if (span.innerText && (span.innerText.includes('Viết bình luận') ||
+                                        span.innerText.includes('Write a comment'))) {
+                                        span.click();
+                                        return true;
+                                    }
+                                }
+                                return false;
+                            })()
+                            '''
+                            clicked = eval_new(click_comment_js)
+                            if not clicked:
+                                self.signal.log_message.emit(f"Không tìm thấy ô comment", "warning")
+                                try:
+                                    new_ws.close()
+                                except:
+                                    pass
+                                send_cdp("Target.closeTarget", {"targetId": target_id})
+                                continue
 
-                        self.signal.log_message.emit(f"✓ Đã comment: {comment_text[:30]}...", "success")
+                            time.sleep(random.uniform(1, 2))
+
+                            # Gõ comment từng ký tự như người thật
+                            for char in comment_text:
+                                # Random typo (3% chance)
+                                if random.random() < 0.03:
+                                    wrong_char = random.choice('abcdefghijklmnopqrstuvwxyz')
+                                    send_new("Input.insertText", {"text": wrong_char})
+                                    time.sleep(random.uniform(0.05, 0.15))
+                                    send_new("Input.dispatchKeyEvent", {
+                                        "type": "keyDown",
+                                        "key": "Backspace",
+                                        "code": "Backspace"
+                                    })
+                                    send_new("Input.dispatchKeyEvent", {
+                                        "type": "keyUp",
+                                        "key": "Backspace",
+                                        "code": "Backspace"
+                                    })
+                                    time.sleep(random.uniform(0.1, 0.2))
+
+                                send_new("Input.insertText", {"text": char})
+                                time.sleep(random.uniform(0.03, 0.12))
+
+                            time.sleep(random.uniform(0.5, 1))
+
+                            # Nhấn Enter để gửi comment
+                            send_new("Input.dispatchKeyEvent", {
+                                "type": "keyDown",
+                                "key": "Enter",
+                                "code": "Enter"
+                            })
+                            time.sleep(0.1)
+                            send_new("Input.dispatchKeyEvent", {
+                                "type": "keyUp",
+                                "key": "Enter",
+                                "code": "Enter"
+                            })
+
+                            time.sleep(random.uniform(2, 3))
+
+                            # Đóng tab mới
+                            try:
+                                new_ws.close()
+                            except:
+                                pass
+                            send_cdp("Target.closeTarget", {"targetId": target_id})
+
+                            self.signal.log_message.emit(f"✓ Đã comment: {comment_text[:30]}...", "success")
+
+                        except Exception as e:
+                            self.signal.log_message.emit(f"Lỗi comment: {str(e)[:30]}", "error")
                     else:
                         self.signal.log_message.emit(f"Bỏ qua: không có URL", "warning")
 

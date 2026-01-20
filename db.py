@@ -202,6 +202,27 @@ def init_database():
             )
         """)
 
+        # Add new columns to schedules if they don't exist
+        new_schedule_columns = [
+            ("profile_uuid", "TEXT"),
+            ("group_id", "INTEGER"),
+            ("group_name", "TEXT"),
+            ("group_url", "TEXT"),
+            ("content_id", "INTEGER"),
+            ("content_title", "TEXT"),
+            ("days_of_week", "TEXT"),
+            ("posts_per_run", "INTEGER DEFAULT 1"),
+            ("delay_minutes", "INTEGER DEFAULT 5"),
+            ("status", "TEXT DEFAULT 'active'"),
+            ("last_run", "TEXT"),
+            ("next_run", "TEXT")
+        ]
+        for col_name, col_type in new_schedule_columns:
+            try:
+                cursor.execute(f"ALTER TABLE schedules ADD COLUMN {col_name} {col_type}")
+            except:
+                pass  # Column already exists
+
         # ============ REEL SCHEDULES TABLE ============
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS reel_schedules (
@@ -1122,12 +1143,14 @@ def get_post_history_count(
 
 # ==================== SCHEDULES ====================
 
-def get_schedules(active_only: bool = False) -> List[Dict]:
+def get_schedules(status: str = None, active_only: bool = False) -> List[Dict]:
     """Lấy danh sách schedules"""
     with get_connection() as conn:
         cursor = conn.cursor()
-        if active_only:
-            cursor.execute("SELECT * FROM schedules WHERE is_active = 1 ORDER BY id")
+        if status:
+            cursor.execute("SELECT * FROM schedules WHERE status = ? ORDER BY id", (status,))
+        elif active_only:
+            cursor.execute("SELECT * FROM schedules WHERE is_active = 1 OR status = 'active' ORDER BY id")
         else:
             cursor.execute("SELECT * FROM schedules ORDER BY id")
         return rows_to_list(cursor.fetchall())
@@ -1143,53 +1166,62 @@ def get_schedule(schedule_id: int) -> Optional[Dict]:
 
 
 def save_schedule(data: Dict) -> Dict:
-    """Lưu schedule (insert hoặc update)"""
+    """Lưu schedule (insert hoặc update) - hỗ trợ cả cấu trúc cũ và mới"""
     with get_connection() as conn:
         cursor = conn.cursor()
         now = datetime.now().isoformat()
 
         if data.get('id'):
-            # Update
-            cursor.execute("""
-                UPDATE schedules SET
-                    name = ?, folder_id = ?, folder_name = ?, time_slots = ?,
-                    content_category_id = ?, image_folder = ?, group_ids = ?,
-                    delay_min = ?, delay_max = ?, is_active = ?, updated_at = ?
-                WHERE id = ?
-            """, (
-                data.get('name', ''),
-                data.get('folder_id', ''),
-                data.get('folder_name', ''),
-                data.get('time_slots', ''),
-                data.get('content_category_id'),
-                data.get('image_folder', ''),
-                data.get('group_ids', ''),
-                data.get('delay_min', 30),
-                data.get('delay_max', 60),
-                data.get('is_active', 1),
-                now,
-                data['id']
-            ))
+            # Update - sử dụng update_schedule
+            update_data = {k: v for k, v in data.items() if k != 'id'}
+            update_data['updated_at'] = now
+            update_schedule(data['id'], update_data)
         else:
-            # Insert
-            cursor.execute("""
-                INSERT INTO schedules (name, folder_id, folder_name, time_slots,
-                    content_category_id, image_folder, group_ids, delay_min, delay_max,
-                    is_active, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                data.get('name', ''),
-                data.get('folder_id', ''),
-                data.get('folder_name', ''),
-                data.get('time_slots', ''),
-                data.get('content_category_id'),
-                data.get('image_folder', ''),
-                data.get('group_ids', ''),
-                data.get('delay_min', 30),
-                data.get('delay_max', 60),
-                data.get('is_active', 1),
-                now, now
-            ))
+            # Insert - hỗ trợ cả 2 cấu trúc
+            # Cấu trúc mới (với group_id, content_id)
+            if data.get('group_id') or data.get('profile_uuid'):
+                cursor.execute("""
+                    INSERT INTO schedules (
+                        name, profile_uuid, group_id, group_name, group_url,
+                        content_id, content_title, time_slots, days_of_week,
+                        posts_per_run, delay_minutes, status, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    data.get('name', data.get('group_name', '')),
+                    data.get('profile_uuid', ''),
+                    data.get('group_id'),
+                    data.get('group_name', ''),
+                    data.get('group_url', ''),
+                    data.get('content_id'),
+                    data.get('content_title', ''),
+                    data.get('time_slots', ''),
+                    data.get('days_of_week', ''),
+                    data.get('posts_per_run', 1),
+                    data.get('delay_minutes', 5),
+                    data.get('status', 'active'),
+                    now, now
+                ))
+            else:
+                # Cấu trúc cũ
+                cursor.execute("""
+                    INSERT INTO schedules (name, folder_id, folder_name, time_slots,
+                        content_category_id, image_folder, group_ids, delay_min, delay_max,
+                        is_active, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    data.get('name', ''),
+                    data.get('folder_id', ''),
+                    data.get('folder_name', ''),
+                    data.get('time_slots', ''),
+                    data.get('content_category_id'),
+                    data.get('image_folder', ''),
+                    data.get('group_ids', ''),
+                    data.get('delay_min', 30),
+                    data.get('delay_max', 60),
+                    data.get('is_active', 1),
+                    now, now
+                ))
             data['id'] = cursor.lastrowid
         return data
 
@@ -1199,6 +1231,29 @@ def delete_schedule(schedule_id: int) -> bool:
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+        return cursor.rowcount > 0
+
+
+def update_schedule(schedule_id: int, data: Dict) -> bool:
+    """Cập nhật schedule theo ID"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        updates = []
+        values = []
+
+        for key, value in data.items():
+            if key != 'id':
+                updates.append(f"{key} = ?")
+                values.append(value)
+
+        if not updates:
+            return False
+
+        values.append(schedule_id)
+        cursor.execute(
+            f"UPDATE schedules SET {', '.join(updates)} WHERE id = ?",
+            values
+        )
         return cursor.rowcount > 0
 
 

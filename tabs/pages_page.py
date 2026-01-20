@@ -1,12 +1,16 @@
 """
 Pages Page - Quan ly cac Fanpage Facebook
 PySide6 version - BEAUTIFUL UI like ProfilesPage
+Có hỗ trợ TẠO PAGE MỚI qua CDP automation
 """
 import threading
+import random
+import uuid as uuid_module
 from typing import List, Dict
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
-    QMessageBox, QTableWidgetItem, QProgressBar
+    QMessageBox, QTableWidgetItem, QProgressBar, QDialog,
+    QTextEdit, QSpinBox
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
 
@@ -49,6 +53,502 @@ class PagesSignal(QObject):
     data_loaded = Signal(dict)  # folders, profiles, pages
     profiles_loaded = Signal(list)
     log_message = Signal(str, str)
+    create_progress = Signal(int, int)  # current, total
+    create_complete = Signal(int)  # count created
+
+
+class CreatePageDialog(QDialog):
+    """Dialog tạo Page mới - PySide6 version"""
+
+    def __init__(self, parent, profile_uuids: List[str], profiles: List[Dict], log_func):
+        super().__init__(parent)
+        self.profile_uuids = profile_uuids
+        self.profiles = profiles
+        self.log = log_func
+        self._is_creating = False
+
+        self.setWindowTitle("Tạo Fanpage mới")
+        self.setFixedSize(520, 450)
+        self.setStyleSheet(f"background: {COLORS['bg_dark']};")
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(16)
+
+        # Header
+        header = QLabel("➕ Tạo Fanpage mới")
+        header.setStyleSheet(f"color: {COLORS['neon_purple']}; font-size: 18px; font-weight: bold;")
+        layout.addWidget(header)
+
+        # Profile info
+        info = QLabel(f"Sẽ tạo Page cho {len(self.profile_uuids)} profile đã chọn")
+        info.setStyleSheet(f"color: {COLORS['neon_cyan']}; font-size: 12px;")
+        layout.addWidget(info)
+
+        # Form card
+        form_card = CyberCard(COLORS['neon_purple'])
+        form_layout = QVBoxLayout(form_card)
+        form_layout.setContentsMargins(16, 16, 16, 16)
+        form_layout.setSpacing(12)
+
+        # Page name
+        name_row = QHBoxLayout()
+        name_label = QLabel("Tên Page:")
+        name_label.setFixedWidth(100)
+        name_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
+        name_row.addWidget(name_label)
+        self.name_input = CyberInput("Nhập tên Page...")
+        name_row.addWidget(self.name_input)
+        form_layout.addLayout(name_row)
+
+        # Category
+        cat_row = QHBoxLayout()
+        cat_label = QLabel("Danh mục:")
+        cat_label.setFixedWidth(100)
+        cat_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
+        cat_row.addWidget(cat_label)
+        self.category_combo = CyberComboBox([
+            "Doanh nghiệp địa phương",
+            "Công ty",
+            "Thương hiệu hoặc sản phẩm",
+            "Nghệ sĩ, ban nhạc hoặc nhân vật công chúng",
+            "Giải trí",
+            "Cộng đồng hoặc trang web"
+        ])
+        cat_row.addWidget(self.category_combo)
+        form_layout.addLayout(cat_row)
+
+        # Description
+        desc_label = QLabel("Mô tả (Tiểu sử):")
+        desc_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
+        form_layout.addWidget(desc_label)
+
+        self.desc_text = QTextEdit()
+        self.desc_text.setPlaceholderText("Nhập mô tả cho Page...")
+        self.desc_text.setFixedHeight(60)
+        self.desc_text.setStyleSheet(f"""
+            QTextEdit {{
+                background: {COLORS['bg_card']};
+                color: {COLORS['text_primary']};
+                border: 2px solid {COLORS['border']};
+                border-radius: 8px;
+                padding: 8px;
+                font-size: 12px;
+            }}
+            QTextEdit:focus {{
+                border-color: {COLORS['neon_purple']};
+            }}
+        """)
+        form_layout.addWidget(self.desc_text)
+
+        # Delay
+        delay_row = QHBoxLayout()
+        delay_label = QLabel("Delay giữa các lần (giây):")
+        delay_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
+        delay_row.addWidget(delay_label)
+        delay_row.addStretch()
+        self.delay_spin = QSpinBox()
+        self.delay_spin.setRange(3, 60)
+        self.delay_spin.setValue(5)
+        self.delay_spin.setFixedWidth(80)
+        self.delay_spin.setStyleSheet(f"""
+            QSpinBox {{
+                background: {COLORS['bg_card']};
+                color: {COLORS['text_primary']};
+                border: 2px solid {COLORS['border']};
+                border-radius: 6px;
+                padding: 4px;
+            }}
+        """)
+        delay_row.addWidget(self.delay_spin)
+        form_layout.addLayout(delay_row)
+
+        layout.addWidget(form_card)
+
+        # Progress
+        self.progress_label = QLabel("")
+        self.progress_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px;")
+        layout.addWidget(self.progress_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setFixedHeight(6)
+        self.progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background: {COLORS['bg_darker']};
+                border: none;
+                border-radius: 3px;
+            }}
+            QProgressBar::chunk {{
+                background: qlineargradient(x1:0, x2:1, stop:0 {COLORS['neon_purple']}, stop:1 {COLORS['neon_mint']});
+                border-radius: 3px;
+            }}
+        """)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(12)
+
+        self.btn_create = CyberButton("TẠO PAGE", "success", "➕")
+        self.btn_create.clicked.connect(self._create_pages)
+        btn_row.addWidget(self.btn_create)
+
+        btn_close = CyberButton("ĐÓNG", "ghost")
+        btn_close.clicked.connect(self.close)
+        btn_row.addWidget(btn_close)
+
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+    def _create_pages(self):
+        """Tạo pages cho các profiles đã chọn"""
+        if self._is_creating:
+            return
+
+        page_name = self.name_input.text().strip()
+        if not page_name:
+            QMessageBox.warning(self, "Lỗi", "Vui lòng nhập tên Page!")
+            return
+
+        self._is_creating = True
+        self.btn_create.setEnabled(False)
+        category = self.category_combo.currentText()
+        description = self.desc_text.toPlainText().strip()
+        delay = self.delay_spin.value()
+
+        self.progress_bar.setMaximum(len(self.profile_uuids))
+        self.progress_bar.setValue(0)
+
+        def create():
+            try:
+                total = len(self.profile_uuids)
+                created_count = 0
+
+                for i, uuid in enumerate(self.profile_uuids):
+                    profile = next((p for p in self.profiles if p['uuid'] == uuid), None)
+                    if not profile:
+                        continue
+
+                    profile_name = profile.get('name', 'Unknown')[:20]
+                    QTimer.singleShot(0, lambda n=profile_name, idx=i+1, t=total:
+                        self.progress_label.setText(f"Đang tạo Page cho {n} ({idx}/{t})..."))
+
+                    # Tạo page
+                    success = self._create_page_for_profile(uuid, page_name, category, description)
+                    if success:
+                        created_count += 1
+
+                    QTimer.singleShot(0, lambda v=i+1: self.progress_bar.setValue(v))
+
+                    # Delay
+                    if i < total - 1:
+                        time.sleep(delay + random.uniform(0, 2))
+
+                QTimer.singleShot(0, lambda c=created_count: self._on_create_complete(c))
+
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                QTimer.singleShot(0, lambda: self.progress_label.setText(f"Lỗi: {e}"))
+            finally:
+                self._is_creating = False
+                QTimer.singleShot(0, lambda: self.btn_create.setEnabled(True))
+
+        threading.Thread(target=create, daemon=True).start()
+
+    def _create_page_for_profile(self, profile_uuid: str, name: str, category: str, description: str) -> bool:
+        """Tạo page cho 1 profile sử dụng CDP automation"""
+        slot_id = acquire_window_slot()
+        created_page_id = None
+
+        try:
+            # Mở browser
+            result = api.open_browser(profile_uuid)
+            print(f"[CreatePage] open_browser {profile_uuid[:8]}: {result.get('status', result.get('type', 'unknown'))}")
+
+            status = result.get('status') or result.get('type')
+            if status not in ['successfully', 'success', True]:
+                if 'already' not in str(result).lower() and 'running' not in str(result).lower():
+                    release_window_slot(slot_id)
+                    return False
+
+            # Lấy thông tin CDP
+            data = result.get('data', {})
+            remote_port = data.get('remote_port')
+            ws_url = data.get('web_socket', '')
+
+            if not remote_port:
+                match = re.search(r':(\d+)/', ws_url)
+                if match:
+                    remote_port = int(match.group(1))
+
+            if not remote_port:
+                release_window_slot(slot_id)
+                return False
+
+            cdp_base = f"http://127.0.0.1:{remote_port}"
+            time.sleep(2)
+
+            # Lấy WebSocket
+            try:
+                resp = requests.get(f"{cdp_base}/json", timeout=10)
+                tabs = resp.json()
+            except Exception as e:
+                print(f"[CreatePage] CDP error: {e}")
+                return False
+
+            page_ws = None
+            for tab in tabs:
+                if tab.get('type') == 'page':
+                    page_ws = tab.get('webSocketDebuggerUrl')
+                    break
+
+            if not page_ws:
+                return False
+
+            # Kết nối WebSocket
+            ws = None
+            try:
+                ws = websocket.create_connection(page_ws, timeout=30, suppress_origin=True)
+            except:
+                try:
+                    ws = websocket.create_connection(page_ws, timeout=30)
+                except:
+                    return False
+
+            if not ws:
+                return False
+
+            # Navigate đến trang tạo Page
+            create_url = "https://www.facebook.com/pages/create"
+            ws.send(json_module.dumps({
+                "id": 1,
+                "method": "Page.navigate",
+                "params": {"url": create_url}
+            }))
+            ws.recv()
+            time.sleep(6)
+
+            # Nhập tên Page
+            js_fill_name = f'''
+            (function() {{
+                var pageName = "{name}";
+                function setValueAndTrigger(input, value) {{
+                    input.focus();
+                    input.click();
+                    if (input.tagName === 'INPUT') {{
+                        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                        nativeInputValueSetter.call(input, value);
+                    }} else {{
+                        input.innerText = value;
+                    }}
+                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }}
+                var confirmedInput = document.querySelector('input.x1i10hfl[type="text"]');
+                if (confirmedInput && confirmedInput.offsetParent !== null) {{
+                    setValueAndTrigger(confirmedInput, pageName);
+                    return 'filled_name';
+                }}
+                var inputs = document.querySelectorAll('input[type="text"], input:not([type])');
+                for (var i = 0; i < inputs.length; i++) {{
+                    if (inputs[i].offsetParent !== null && !inputs[i].value) {{
+                        setValueAndTrigger(inputs[i], pageName);
+                        return 'filled_first_input';
+                    }}
+                }}
+                return 'no_name_input';
+            }})();
+            '''
+            ws.send(json_module.dumps({"id": 10, "method": "Runtime.evaluate", "params": {"expression": js_fill_name}}))
+            ws.recv()
+            time.sleep(1.5)
+
+            # Nhập Category
+            js_fill_category = f'''
+            (function() {{
+                var categoryText = "{category}";
+                function setValueAndTrigger(input, value) {{
+                    input.focus();
+                    input.click();
+                    var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(input, value);
+                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }}
+                var categoryInput = document.querySelector('input[aria-label="Hạng mục (Bắt buộc)"]');
+                if (categoryInput && categoryInput.offsetParent !== null) {{
+                    setValueAndTrigger(categoryInput, categoryText);
+                    return 'filled_category';
+                }}
+                var searchInputs = document.querySelectorAll('input[type="search"]');
+                for (var i = 0; i < searchInputs.length; i++) {{
+                    var ariaLabel = searchInputs[i].getAttribute('aria-label') || '';
+                    if (!ariaLabel.includes('Tìm kiếm') && searchInputs[i].offsetParent !== null) {{
+                        setValueAndTrigger(searchInputs[i], categoryText);
+                        return 'filled_search_input';
+                    }}
+                }}
+                return 'no_category_input';
+            }})();
+            '''
+            ws.send(json_module.dumps({"id": 11, "method": "Runtime.evaluate", "params": {"expression": js_fill_category}}))
+            ws.recv()
+            time.sleep(2)
+
+            # ArrowDown + Enter để chọn suggestion
+            js_select = '''
+            (function() {
+                var input = document.querySelector('input[aria-label="Hạng mục (Bắt buộc)"]') || document.activeElement;
+                if (input && input.tagName === 'INPUT') {
+                    input.dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowDown', code: 'ArrowDown', keyCode: 40, bubbles: true}));
+                    return 'arrow_down';
+                }
+                return 'no_input';
+            })();
+            '''
+            ws.send(json_module.dumps({"id": 12, "method": "Runtime.evaluate", "params": {"expression": js_select}}))
+            ws.recv()
+            time.sleep(0.5)
+
+            js_enter = '''
+            (function() {
+                var input = document.querySelector('input[aria-label="Hạng mục (Bắt buộc)"]') || document.activeElement;
+                if (input) {
+                    input.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true}));
+                    return 'enter';
+                }
+                return 'no_input';
+            })();
+            '''
+            ws.send(json_module.dumps({"id": 13, "method": "Runtime.evaluate", "params": {"expression": js_enter}}))
+            ws.recv()
+            time.sleep(1.5)
+
+            # Điền Bio nếu có
+            if description:
+                escaped_desc = description.replace('"', '\\"').replace('\n', '\\n')
+                js_fill_bio = f'''
+                (function() {{
+                    var bioText = "{escaped_desc}";
+                    function setTextareaValue(textarea, value) {{
+                        textarea.focus();
+                        textarea.click();
+                        var setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+                        setter.call(textarea, value);
+                        textarea.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        textarea.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    }}
+                    var bioTextarea = document.querySelector('textarea.x1i10hfl');
+                    if (bioTextarea && bioTextarea.offsetParent !== null) {{
+                        setTextareaValue(bioTextarea, bioText);
+                        return 'filled_bio';
+                    }}
+                    return 'no_bio_textarea';
+                }})();
+                '''
+                ws.send(json_module.dumps({"id": 15, "method": "Runtime.evaluate", "params": {"expression": js_fill_bio}}))
+                ws.recv()
+                time.sleep(1)
+
+            # Click nút Tạo Trang
+            js_click_create = '''
+            (function() {
+                var buttons = document.querySelectorAll('div[role="button"], button, span[role="button"]');
+                for (var i = 0; i < buttons.length; i++) {
+                    var btn = buttons[i];
+                    var text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+                    var ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
+                    if (text === 'create page' || text === 'tạo trang' ||
+                        ariaLabel.includes('create page') || ariaLabel.includes('tạo trang')) {
+                        btn.scrollIntoView({behavior: 'smooth', block: 'center'});
+                        setTimeout(function() { btn.click(); }, 300);
+                        return 'clicked: ' + text;
+                    }
+                }
+                return 'no_create_button';
+            })();
+            '''
+            ws.send(json_module.dumps({"id": 16, "method": "Runtime.evaluate", "params": {"expression": js_click_create}}))
+            ws.recv()
+
+            # Đợi page được tạo
+            page_url = ""
+            for wait_attempt in range(15):
+                time.sleep(2)
+                ws.send(json_module.dumps({
+                    "id": 20 + wait_attempt,
+                    "method": "Runtime.evaluate",
+                    "params": {"expression": "window.location.href"}
+                }))
+                result = json_module.loads(ws.recv())
+                current_url = result.get('result', {}).get('result', {}).get('value', '')
+                print(f"[CreatePage] URL check {wait_attempt + 1}: {current_url}")
+
+                if '/pages/create' not in current_url:
+                    page_url = current_url
+                    print(f"[CreatePage] Page created! URL: {page_url}")
+                    break
+
+            # Lấy page ID từ URL
+            if page_url:
+                match = re.search(r'id=(\d+)', page_url)
+                if not match:
+                    match = re.search(r'facebook\.com/(\d{10,})', page_url)
+                if not match:
+                    match = re.search(r'facebook\.com/([^/?]+)', page_url)
+                if match:
+                    created_page_id = match.group(1)
+
+            ws.close()
+
+            # Lưu vào database
+            if created_page_id and page_url:
+                page_data = {
+                    'profile_uuid': profile_uuid,
+                    'page_id': created_page_id,
+                    'page_name': name,
+                    'page_url': page_url,
+                    'category': category,
+                    'follower_count': 0,
+                    'role': 'admin',
+                    'note': description
+                }
+                save_page(page_data)
+                print(f"[CreatePage] SUCCESS! Page ID: {created_page_id}")
+                return True
+            else:
+                # Lưu với ID tạm
+                page_data = {
+                    'profile_uuid': profile_uuid,
+                    'page_id': f"temp_{str(uuid_module.uuid4())[:8]}",
+                    'page_name': name,
+                    'page_url': '',
+                    'category': category,
+                    'follower_count': 0,
+                    'role': 'admin',
+                    'note': f"{description}\n[Cần scan lại để lấy Page ID thực]"
+                }
+                save_page(page_data)
+                return True
+
+        except Exception as e:
+            import traceback
+            print(f"[CreatePage] ERROR: {traceback.format_exc()}")
+            return False
+        finally:
+            release_window_slot(slot_id)
+
+    def _on_create_complete(self, count: int):
+        """Khi tạo xong"""
+        self.progress_label.setText(f"Đã tạo {count} pages!")
+        self.progress_label.setStyleSheet(f"color: {COLORS['neon_mint']}; font-size: 11px;")
+        self.progress_bar.setValue(self.progress_bar.maximum())
+        self.log(f"Đã tạo {count} Fanpages mới", "success")
 
 
 class PagesPage(QWidget):
@@ -139,7 +639,11 @@ class PagesPage(QWidget):
         btn_scan.clicked.connect(self._scan_pages)
         toolbar.addWidget(btn_scan)
 
-        btn_delete = CyberButton("XOA", "danger", "🗑️")
+        btn_create = CyberButton("TẠO PAGE", "success", "➕")
+        btn_create.clicked.connect(self._open_create_dialog)
+        toolbar.addWidget(btn_create)
+
+        btn_delete = CyberButton("XÓA", "danger", "🗑️")
         btn_delete.clicked.connect(self._delete_selected_pages)
         toolbar.addWidget(btn_delete)
 
@@ -654,12 +1158,39 @@ class PagesPage(QWidget):
 
         return pages_found
 
+    def _open_create_dialog(self):
+        """Mở dialog tạo Page mới"""
+        # Lấy danh sách profile để tạo page
+        profile_idx = self.profile_combo.currentIndex()
+
+        if profile_idx <= 0:
+            # Chọn tất cả profiles
+            if not self.profiles:
+                QMessageBox.warning(self, "Lỗi", "Không có profile nào!")
+                return
+            profile_uuids = [p.get('uuid') for p in self.profiles]
+        else:
+            # Chỉ profile đã chọn
+            profile = self.profiles[profile_idx - 1]
+            profile_uuids = [profile.get('uuid')]
+
+        if not profile_uuids:
+            QMessageBox.warning(self, "Lỗi", "Vui lòng chọn profile trước!")
+            return
+
+        # Mở dialog
+        dialog = CreatePageDialog(self, profile_uuids, self.profiles, self.log)
+        dialog.exec()
+
+        # Refresh sau khi đóng dialog
+        self._filter_pages_by_profile()
+
     def _delete_selected_pages(self):
         """Xoa cac pages đã chọn"""
         selected_ids = [pid for pid, cb in self.page_checkboxes.items() if cb.isChecked()]
 
         if not selected_ids:
-            QMessageBox.warning(self, "Loi", "Chưa chọn page nào!")
+            QMessageBox.warning(self, "Lỗi", "Chưa chọn page nào!")
             return
 
         reply = QMessageBox.question(
