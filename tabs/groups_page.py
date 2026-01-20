@@ -956,20 +956,22 @@ class GroupsPage(QWidget):
             # ID
             self.scan_table.setItem(row, 1, QTableWidgetItem(str(row + 1)))
 
-            # Name
-            name = group.get('name', 'Unknown')[:40]
-            self.scan_table.setItem(row, 2, QTableWidgetItem(name))
+            # Name - hỗ trợ cả 'name' và 'group_name'
+            name = group.get('group_name') or group.get('name', 'Unknown')
+            self.scan_table.setItem(row, 2, QTableWidgetItem(name[:40]))
 
             # Group ID
             fb_id = group.get('group_id', '')
             self.scan_table.setItem(row, 3, QTableWidgetItem(str(fb_id)))
 
             # Members
-            members = group.get('members', 0)
+            members = group.get('member_count') or group.get('members', 0)
             self.scan_table.setItem(row, 4, QTableWidgetItem(str(members)))
 
             # Date
-            scan_date = group.get('scan_date', '')[:10] if group.get('scan_date') else ''
+            scan_date = group.get('scan_date', '') or group.get('created_at', '')
+            if scan_date:
+                scan_date = scan_date[:10]
             self.scan_table.setItem(row, 5, QTableWidgetItem(scan_date))
 
     def _scan_groups(self):
@@ -1005,11 +1007,6 @@ class GroupsPage(QWidget):
 
                     self.signal.scan_progress.emit(i + 1, total)
 
-                # Lưu vào DB
-                if all_groups:
-                    for g in all_groups:
-                        save_group(g)
-
                 self.signal.scan_complete.emit()
                 self.signal.log_message.emit(f"Quét xong! Tìm thấy {len(all_groups)} nhóm", "success")
 
@@ -1022,12 +1019,12 @@ class GroupsPage(QWidget):
         threading.Thread(target=scan, daemon=True).start()
 
     def _execute_group_scan_for_profile(self, profile_uuid: str):
-        """Quét nhóm cho 1 profile - MỞ BROWSER VÀ QUÉT THẬT"""
+        """Quét nhóm cho 1 profile - GIỐNG CODE GỐC"""
         groups_found = []
         slot_id = acquire_window_slot()
 
         try:
-            # Bước 1: Mở browser qua Hidemium API
+            # Bước 1: Mở browser
             self.signal.log_message.emit(f"Mở browser {profile_uuid[:8]}...", "info")
             result = api.open_browser(profile_uuid)
             print(f"[DEBUG] open_browser: {result}")
@@ -1035,7 +1032,7 @@ class GroupsPage(QWidget):
             status = result.get('status') or result.get('type')
             if status not in ['successfully', 'success', True]:
                 if 'already' not in str(result).lower() and 'running' not in str(result).lower():
-                    self.signal.log_message.emit(f"Không mở được browser: {result}", "error")
+                    self.signal.log_message.emit(f"Không mở được browser", "error")
                     release_window_slot(slot_id)
                     return []
 
@@ -1056,16 +1053,14 @@ class GroupsPage(QWidget):
 
             cdp_base = f"http://127.0.0.1:{remote_port}"
             self.signal.log_message.emit(f"CDP port: {remote_port}", "info")
-
-            # Đợi browser khởi động
             time.sleep(2)
 
-            # Bước 2: Lấy WebSocket URL
+            # Bước 2: Lấy WebSocket
             try:
                 resp = requests.get(f"{cdp_base}/json", timeout=10)
                 tabs = resp.json()
             except Exception as e:
-                self.signal.log_message.emit(f"Lỗi kết nối CDP: {e}", "error")
+                self.signal.log_message.emit(f"Lỗi CDP: {e}", "error")
                 release_window_slot(slot_id)
                 return []
 
@@ -1076,15 +1071,13 @@ class GroupsPage(QWidget):
                     break
 
             if not page_ws:
-                self.signal.log_message.emit("Không tìm thấy page WebSocket", "error")
                 release_window_slot(slot_id)
                 return []
 
-            # Bước 3: Kết nối WebSocket và navigate
+            # Bước 3: Kết nối WebSocket
             try:
                 ws = websocket.create_connection(page_ws, timeout=30, suppress_origin=True)
-            except Exception as e:
-                self.signal.log_message.emit(f"Lỗi kết nối WebSocket: {e}", "error")
+            except:
                 release_window_slot(slot_id)
                 return []
 
@@ -1098,51 +1091,98 @@ class GroupsPage(QWidget):
                 "params": {"url": groups_url}
             }))
             ws.recv()
-
-            # Đợi trang load
             time.sleep(8)
 
-            # Bước 4: Lấy HTML và parse
-            self.signal.log_message.emit("Đang quét danh sách nhóm...", "info")
+            # Bước 4: CUỘN TRANG - GIỐNG CODE GỐC (đơn giản)
+            self.signal.log_message.emit("Đang cuộn trang...", "info")
+            for i in range(10):
+                ws.send(json_module.dumps({
+                    "id": 100 + i,
+                    "method": "Runtime.evaluate",
+                    "params": {"expression": "window.scrollTo(0, document.body.scrollHeight);"}
+                }))
+                ws.recv()
+                time.sleep(2)
 
+            # Bước 5: Lấy HTML
+            self.signal.log_message.emit("Đang quét danh sách nhóm...", "info")
             ws.send(json_module.dumps({
-                "id": 2,
+                "id": 200,
                 "method": "Runtime.evaluate",
                 "params": {"expression": "document.documentElement.outerHTML"}
             }))
-            html_result = json_module.loads(ws.recv())
-            html = html_result.get('result', {}).get('result', {}).get('value', '')
+            result = json_module.loads(ws.recv())
+            html = result.get('result', {}).get('result', {}).get('value', '')
 
             ws.close()
+            print(f"[Groups] Got HTML, length={len(html) if html else 0}")
 
-            # Parse HTML bằng BeautifulSoup
-            if html and BS4_AVAILABLE:
-                soup = BeautifulSoup(html, 'html.parser')
+            if not html:
+                release_window_slot(slot_id)
+                return []
 
-                # Tìm các nhóm - Facebook dùng nhiều pattern khác nhau
-                group_links = soup.find_all('a', href=re.compile(r'/groups/\d+'))
+            # Parse HTML - GIỐNG CODE GỐC
+            soup = BeautifulSoup(html, 'html.parser')
 
-                seen_ids = set()
-                for link in group_links:
-                    href = link.get('href', '')
-                    match = re.search(r'/groups/(\d+)', href)
+            # Thử nhiều cách tìm links nhóm
+            links = soup.find_all('a', {'aria-label': 'Xem nhóm'})
+            print(f"[Groups] Found {len(links)} links with aria-label='Xem nhóm'")
+
+            if not links:
+                links = soup.find_all('a', {'aria-label': 'Visit group'})
+                print(f"[Groups] Found {len(links)} links with aria-label='Visit group'")
+
+            if not links:
+                # Fallback: Tìm tất cả links có /groups/ trong href
+                links = soup.find_all('a', href=re.compile(r'/groups/[^/]+/?$'))
+                print(f"[Groups] Found {len(links)} links matching /groups/xxx pattern")
+
+            for link in links:
+                href = link.get('href', '')
+                if '/groups/' in href:
+                    match = re.search(r'/groups/([^/?]+)', href)
                     if match:
                         group_id = match.group(1)
-                        if group_id not in seen_ids:
-                            seen_ids.add(group_id)
 
-                            # Lấy tên nhóm
-                            name = link.get_text(strip=True) or f"Nhóm {group_id}"
+                        if group_id in ['joins', 'feed', 'discover', 'create', 'settings']:
+                            continue
 
+                        group_name = group_id
+
+                        # Tìm tên nhóm trong parent elements
+                        parent = link
+                        for _ in range(10):
+                            parent = parent.find_parent()
+                            if parent is None:
+                                break
+                            spans = parent.find_all(['span', 'div'], recursive=False)
+                            for span in spans:
+                                text = span.get_text(strip=True)
+                                skip_texts = ['Xem nhóm', 'Visit group', 'View group', 'Tham gia', 'Join']
+                                if text and len(text) > 3 and text not in skip_texts and not text.startswith('http'):
+                                    if len(text) < 150:
+                                        group_name = text
+                                        break
+                            if group_name != group_id:
+                                break
+
+                        group_url = f"https://www.facebook.com/groups/{group_id}/"
+
+                        if not any(g['group_id'] == group_id for g in groups_found):
                             groups_found.append({
-                                'profile_uuid': profile_uuid,
                                 'group_id': group_id,
-                                'name': name[:100],
-                                'members': 0,
-                                'scan_date': time.strftime('%Y-%m-%d %H:%M:%S')
+                                'group_name': group_name,
+                                'group_url': group_url,
+                                'member_count': 0,
+                                'profile_uuid': profile_uuid
                             })
 
-                self.signal.log_message.emit(f"Tìm thấy {len(groups_found)} nhóm", "success")
+            # Lưu vào database - DÙNG sync_groups GIỐNG CODE GỐC
+            print(f"[Groups] Profile {profile_uuid[:8]} found {len(groups_found)} groups")
+            if groups_found:
+                sync_groups(profile_uuid, groups_found)
+
+            self.signal.log_message.emit(f"Tìm thấy {len(groups_found)} nhóm", "success")
 
         except Exception as e:
             import traceback
@@ -1165,6 +1205,15 @@ class GroupsPage(QWidget):
         self.btn_scan.setEnabled(True)
         self.btn_stop_scan.setEnabled(False)
         self.scan_progress.setValue(100)
+
+        # QUAN TRỌNG: Reload groups từ DB và render lại UI
+        if self.selected_profile_uuids:
+            self.groups = get_groups_for_profiles(self.selected_profile_uuids)
+            self._render_scan_groups()
+            self._render_post_groups()
+            self.stat_groups.set_value(str(len(self.groups)))
+            self.scan_stats.setText(f"Tổng: {len(self.groups)} nhóm")
+
         self.log("Quét nhóm hoàn tất!", "success")
 
     def _clear_all_groups(self):
@@ -1205,7 +1254,7 @@ class GroupsPage(QWidget):
 
         for group in self.groups:
             group_id = group.get('id')
-            name = group.get('name', 'Unknown')
+            name = group.get('group_name') or group.get('name', 'Unknown')
 
             row = QWidget()
             row.setFixedHeight(36)
