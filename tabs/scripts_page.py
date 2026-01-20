@@ -10,14 +10,14 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
-    QScrollArea, QMessageBox, QSpinBox, QProgressBar
+    QScrollArea, QMessageBox, QSpinBox, QProgressBar, QTabWidget
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
 
 from config import COLORS
 from widgets import (
     CyberButton, CyberInput, CyberComboBox, CyberCard,
-    CyberTitle, CyberStatCard, CyberCheckBox, CyberTabWidget
+    CyberTitle, CyberStatCard, CyberCheckBox
 )
 from db import (
     get_schedules, save_schedule, delete_schedule, update_schedule,
@@ -104,7 +104,32 @@ class ScriptsPage(QWidget):
         layout.addLayout(top_bar)
 
         # Tab widget
-        self.tab_widget = CyberTabWidget()
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setStyleSheet(f"""
+            QTabWidget::pane {{
+                background: {COLORS['bg_card']};
+                border: 2px solid {COLORS['border']};
+                border-radius: 12px;
+            }}
+            QTabBar::tab {{
+                background: {COLORS['bg_darker']};
+                color: {COLORS['text_muted']};
+                padding: 10px 24px;
+                margin-right: 4px;
+                border-radius: 8px 8px 0 0;
+                font-weight: bold;
+                font-size: 12px;
+            }}
+            QTabBar::tab:selected {{
+                background: {COLORS['bg_card']};
+                color: {COLORS['neon_cyan']};
+                border-bottom: 3px solid {COLORS['neon_cyan']};
+            }}
+            QTabBar::tab:hover:!selected {{
+                background: {COLORS['bg_hover']};
+                color: {COLORS['text_primary']};
+            }}
+        """)
         self.tab_widget.addTab(self._create_schedule_tab(), "Tạo lịch")
         self.tab_widget.addTab(self._create_list_tab(), "Danh sách lịch")
         layout.addWidget(self.tab_widget, 1)
