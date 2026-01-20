@@ -610,13 +610,13 @@ class PagesPage(QWidget):
         toolbar.setSpacing(8)
 
         # Folder filter
-        self.folder_combo = CyberComboBox(["📁 Tat ca folder"])
+        self.folder_combo = CyberComboBox(["📁 Tất cả folder"])
         self.folder_combo.setFixedWidth(180)
         self.folder_combo.currentIndexChanged.connect(self._on_folder_change)
         toolbar.addWidget(self.folder_combo)
 
         # Profile filter
-        self.profile_combo = CyberComboBox(["👤 Tat ca profile"])
+        self.profile_combo = CyberComboBox(["👤 Tất cả profile"])
         self.profile_combo.setFixedWidth(200)
         self.profile_combo.currentIndexChanged.connect(self._on_profile_change)
         toolbar.addWidget(self.profile_combo)

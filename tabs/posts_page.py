@@ -22,8 +22,23 @@ from widgets import (
 )
 from db import get_posts, save_post, delete_post, update_post_stats, get_post_history
 from api_service import api
-from automation.window_manager import acquire_window_slot, release_window_slot, get_window_bounds
-from automation import CDPHelper
+
+# Import automation modules với fallback
+try:
+    from automation.window_manager import acquire_window_slot, release_window_slot, get_window_bounds
+    WINDOW_MANAGER_AVAILABLE = True
+except ImportError:
+    WINDOW_MANAGER_AVAILABLE = False
+    def acquire_window_slot(): return 0
+    def release_window_slot(slot_id): pass
+    def get_window_bounds(slot_id): return (0, 0, 800, 600)
+
+try:
+    from automation import CDPHelper
+    CDP_AVAILABLE = True
+except ImportError:
+    CDPHelper = None
+    CDP_AVAILABLE = False
 
 
 class PostsSignal(QObject):

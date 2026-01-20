@@ -203,7 +203,7 @@ class ContentPage(QWidget):
         content_header_layout.addWidget(self.selected_label)
 
         # Search
-        self.search_input = CyberInput("🔍 Tim kiem...")
+        self.search_input = CyberInput("🔍 Tìm kiếm...")
         self.search_input.setFixedWidth(180)
         self.search_input.textChanged.connect(self._filter_contents)
         content_header_layout.addWidget(self.search_input)

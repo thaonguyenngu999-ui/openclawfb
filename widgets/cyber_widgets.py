@@ -64,6 +64,21 @@ class CyberButton(QPushButton):
             }}
         """)
 
+    def setVariant(self, variant: str):
+        """Thay đổi variant/màu của button sau khi khởi tạo"""
+        colors = {
+            "primary": (COLORS["neon_pink"], COLORS["neon_purple"]),
+            "success": (COLORS["neon_mint"], COLORS["neon_cyan"]),
+            "danger": (COLORS["neon_coral"], COLORS["neon_pink"]),
+            "warning": (COLORS["neon_yellow"], COLORS["neon_coral"]),
+            "purple": (COLORS["neon_purple"], COLORS["neon_blue"]),
+            "cyan": (COLORS["neon_cyan"], COLORS["neon_mint"]),
+            "ghost": (COLORS["text_muted"], COLORS["border"]),
+        }
+        self.variant = variant
+        self.color1, self.color2 = colors.get(variant, colors["primary"])
+        self._apply_style()
+
 
 class ToggleButton(QPushButton):
     """Toggle button Start/Stop 🐱"""
