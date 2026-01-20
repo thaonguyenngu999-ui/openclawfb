@@ -283,6 +283,56 @@ def init_database():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_reel_schedules_profile ON reel_schedules(profile_uuid)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_reel_schedules_status ON reel_schedules(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_posted_reels_profile ON posted_reels(profile_uuid)")
+        
+        # Thêm composite indexes cho performance tốt hơn
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_post_history_profile_date ON post_history(profile_uuid, created_at DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_post_history_composite ON post_history(profile_uuid, status, created_at DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_reel_schedules_time ON reel_schedules(scheduled_time)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_posted_reels_page ON posted_reels(page_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_posted_reels_date ON posted_reels(posted_at DESC)")
+
+
+def migrate_from_json():
+    """Migrate dữ liệu từ JSON files cũ sang SQLite database"""
+    import json
+    
+    json_files = {
+        'categories': os.path.join(DATA_DIR, 'categories.json'),
+        'contents': os.path.join(DATA_DIR, 'contents.json'),
+        'scripts': os.path.join(DATA_DIR, 'scripts.json'),
+        'groups': os.path.join(DATA_DIR, 'groups.json'),
+    }
+    
+    migrated = []
+    
+    for table, json_path in json_files.items():
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                if isinstance(data, list) and data:
+                    count = 0
+                    for item in data:
+                        if table == 'categories':
+                            save_category(item)
+                        elif table == 'contents':
+                            save_content(item)
+                        elif table == 'scripts':
+                            save_script(item)
+                        elif table == 'groups':
+                            save_group(item)
+                        count += 1
+                    
+                    # Rename old JSON file
+                    backup_path = json_path + '.bak'
+                    os.rename(json_path, backup_path)
+                    migrated.append(f"{table}: {count} items")
+                    
+            except Exception as e:
+                print(f"Error migrating {table}: {e}")
+    
+    return migrated")
 
 
 def row_to_dict(row) -> Dict:
