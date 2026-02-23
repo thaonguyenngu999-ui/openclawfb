@@ -631,6 +631,22 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
 
     if act == "list_profiles":
         folder_id = params.get("folder_id")
+        # If no folder specified → show summary per folder instead of dumping all profiles
+        if not folder_id:
+            folders_result = await call_fb_api("/list_folders", data={})
+            if "error" not in folders_result:
+                folders = folders_result.get("folders", [])
+                if folders:
+                    grand_total = 0
+                    text = "📊 **Tổng hợp profiles:**\n\n"
+                    for f in folders:
+                        name = f.get("name", "?")
+                        count = f.get("total_browser", f.get("browser_count", 0))
+                        grand_total += count if isinstance(count, int) else 0
+                        text += f"📁 **{name}**: {count} profiles\n"
+                    text += f"\n📊 **Tổng: {grand_total} profiles**"
+                    text += "\n\n💡 Gõ `fb1`, `fb3`... để xem chi tiết từng folder"
+                    return text
         data = {}
         if folder_id:
             data["folder_id"] = folder_id
@@ -642,13 +658,24 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
         if isinstance(profiles, dict):
             profiles = profiles.get("content", [])
         if not profiles:
-            return "📱 Không tìm thấy profiles nào."
-        text = f"📱 **Profiles** ({len(profiles)}):\n"
-        for p in profiles[:20]:
+            return f"📱 Folder {folder_id}: 0 profiles."
+        folder_label = folder_id.upper() if folder_id else "ALL"
+        text = f"📱 **{folder_label}** ({len(profiles)} profiles):\n"
+        for p in profiles[:30]:
             name = p.get("name", "?")
-            text += f"• `{name}`\n"
-        if len(profiles) > 20:
-            text += f"... +{len(profiles)-20} profiles khác"
+            note = p.get("note", "")
+            status_icon = ""
+            if note:
+                note_lower = note.lower()
+                if "live" in note_lower: status_icon = "✅"
+                elif "die" in note_lower: status_icon = "❌"
+                elif "lock" in note_lower: status_icon = "🔒"
+            text += f"• {status_icon}`{name}`"
+            if note:
+                text += f" — {note[:30]}"
+            text += "\n"
+        if len(profiles) > 30:
+            text += f"... +{len(profiles)-30} profiles khác"
         return text
 
     if act == "check_login":
@@ -1554,26 +1581,45 @@ def try_quick_parse(text: str) -> dict | None:
     if profile and re.search(r'vision.*capture|chụp.*vision|phân tích.*dom|phân tích.*giao diện|analyze', text_lower):
         return {"action": "vision_capture", "params": {"profile": profile}, "reply": f"📸 Đang chụp vision {profile}..."}
 
-    # ===== CHECK + DELETE DIE (combo: "fb3 10 luồng die thì xóa") =====
-    if folder_id and re.search(r'die.*xóa|xóa.*die|die.*thì.*xóa|check.*xóa|xóa.*chết', text_lower):
+    # ===== CHECK + DELETE DIE (combo: "fb3 10 luồng die thì xóa" or "check toàn bộ die xóa") =====
+    if re.search(r'die.*xóa|xóa.*die|die.*thì.*xóa|check.*xóa|xóa.*chết|die.*thì.*xoá', text_lower):
         conc_match = re.search(r'(\d+)\s*(?:luồng|thread|worker)', text_lower)
         concurrency = int(conc_match.group(1)) if conc_match else 5
-        return {"action": "delete_die_profiles", "params": {"folder_id": folder_id, "concurrency": concurrency}, "reply": f"🗑️ Đang check {folder_id} ({concurrency} luồng) rồi xóa die..."}
+        is_all = re.search(r'toàn bộ|tất cả|all|hết|mọi|every', text_lower)
+        if folder_id and not is_all:
+            return {"action": "delete_die_profiles", "params": {"folder_id": folder_id, "concurrency": concurrency}, "reply": f"🗑️ Đang check {folder_id} ({concurrency} luồng) rồi xóa die..."}
+        else:
+            return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🗑️ Đang check & xóa die TOÀN BỘ ({concurrency} luồng)..."}
 
     # ===== DELETE DIE PROFILES =====
     if re.search(r'xóa.*die|delete.*die|xóa.*chết|dọn.*die|xoá.*die', text_lower):
+        conc_match = re.search(r'(\d+)\s*(?:luồng|thread|worker)', text_lower)
+        concurrency = int(conc_match.group(1)) if conc_match else 5
         # Check if user wants ALL folders
         if re.search(r'toàn bộ|tất cả|all|hết|mọi|every', text_lower):
-            return {"action": "delete_die_all", "params": {}, "reply": "🗑️ Đang check & xóa die TOÀN BỘ thư mục..."}
+            return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🗑️ Đang check & xóa die TOÀN BỘ ({concurrency} luồng)..."}
         target_folder = folder_id
         if not target_folder:
             fm = re.search(r'fb\s*(\d+)', text_lower)
             if fm:
                 target_folder = f"fb{fm.group(1)}"
         if target_folder:
-            return {"action": "delete_die_profiles", "params": {"folder_id": target_folder}, "reply": f"🗑️ Đang check & xóa die trong {target_folder}..."}
+            return {"action": "delete_die_profiles", "params": {"folder_id": target_folder, "concurrency": concurrency}, "reply": f"🗑️ Đang check & xóa die trong {target_folder} ({concurrency} luồng)..."}
         # No specific folder → do all
-        return {"action": "delete_die_all", "params": {}, "reply": "🗑️ Đang check & xóa die TOÀN BỘ thư mục..."}
+        return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🗑️ Đang check & xóa die TOÀN BỘ ({concurrency} luồng)..."}
+
+    # ===== COUNT / SUMMARY PROFILES =====
+    if re.search(r'tổng.*bao nhiêu|còn bao nhiêu|bao nhiêu.*profile|bao nhiêu.*acc|tổng.*profile|còn.*mấy.*profile|count.*profile|tổng.*acc', text_lower) and not profile:
+        return {"action": "list_folders", "params": {}, "reply": "📊 Đang đếm profiles..."}
+
+    # ===== CHECK TOÀN BỘ (without die/xóa → just batch check all) =====
+    if re.search(r'check.*toàn bộ|check.*tất cả|check.*all|kiểm tra.*toàn bộ|kiểm tra.*tất cả', text_lower) and not folder_id:
+        conc_match = re.search(r'(\d+)\s*(?:luồng|thread|worker)', text_lower)
+        concurrency = int(conc_match.group(1)) if conc_match else 5
+        # If mentions die/xóa → delete_die_all (already caught above, but safety)
+        if re.search(r'die.*xóa|xóa.*die|die.*thì.*xóa', text_lower):
+            return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🗑️ Đang check & xóa die TOÀN BỘ ({concurrency} luồng)..."}
+        return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🔍 Đang check TOÀN BỘ ({concurrency} luồng)..."}
 
     # ===== LIST FOLDERS =====
     if re.search(r'thư mục|folder|bao nhiêu.*fb|mấy.*fb|các fb|list.*folder|danh sách.*folder', text_lower) and not profile:
