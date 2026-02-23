@@ -359,17 +359,54 @@ class APIHandler(BaseHTTPRequestHandler):
             page = params.get('page', 1)
             page_size = params.get('page_size', 100)
             search = params.get('search', '')
-            # Map string folder names (fb1, fb2...) to numeric Hidemium folder IDs
-            FOLDER_NAME_MAP = {
-                'fb1': 1, 'fb2': 2, 'fb5': 5, 'fb6': 6, 'fb7': 7,
-                '1': 1, '2': 2, '5': 5, '6': 6, '7': 7,
-            }
+            # Resolve folder names to numeric IDs dynamically
             if folder_id is not None and not isinstance(folder_id, list):
                 folder_id = [folder_id]
             if folder_id is None:
                 folder_id = []
-            # Convert string names to numeric IDs
-            folder_id = [FOLDER_NAME_MAP.get(str(f).lower().strip(), f) for f in folder_id]
+            # Convert string names/aliases to numeric IDs
+            if folder_id:
+                resolved = []
+                for f in folder_id:
+                    f_str = str(f).strip()
+                    # Already numeric
+                    if f_str.isdigit():
+                        resolved.append(int(f_str))
+                        continue
+                    # Try static map first (fb1→1, etc)
+                    STATIC_MAP = {
+                        'fb1': 1, 'fb2': 2, 'fb3': 6, 'fb5': 5, 'fb6': 6, 'fb7': 7,
+                    }
+                    f_lower = f_str.lower()
+                    if f_lower in STATIC_MAP:
+                        resolved.append(STATIC_MAP[f_lower])
+                        continue
+                    # Dynamic lookup: fetch folders and match by name
+                    try:
+                        from api_service import api as hidemium
+                        all_folders = hidemium.get_folders(limit=100)
+                        matched = None
+                        for fld in all_folders:
+                            fname = fld.get('name', '').lower().strip()
+                            if fname == f_lower or fname.replace(' ', '') == f_lower.replace(' ', ''):
+                                matched = fld.get('id')
+                                break
+                        if matched:
+                            resolved.append(matched)
+                        else:
+                            # Partial match
+                            for fld in all_folders:
+                                fname = fld.get('name', '').lower().strip()
+                                if f_lower in fname or fname in f_lower:
+                                    matched = fld.get('id')
+                                    break
+                            if matched:
+                                resolved.append(matched)
+                            else:
+                                resolved.append(f)  # pass as-is, let Hidemium handle
+                    except Exception:
+                        resolved.append(f)
+                folder_id = resolved
             try:
                 import requests as req
                 resp = req.post(

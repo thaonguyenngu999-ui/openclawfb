@@ -1256,9 +1256,15 @@ def try_quick_parse(text: str) -> dict | None:
     elif a_matches:
         profile = f"A{a_matches[0]}"
     
-    # Extract folder (fb1, fb2, fb5, fb6)
+    # Extract folder (fb1, fb2, fb5, fb6, or named folders like "FB OK", "FB3")
     folder_match = re.search(r'fb\s*(\d+)', text_lower)
     folder_id = f"fb{folder_match.group(1)}" if folder_match else None
+    
+    # Also try named folder patterns: "FB OK", "FBOK", "fb ok"
+    if not folder_id:
+        named_folder_match = re.search(r'\b(fb\s*ok|fbok|fb\s*3|đông\s*hưng)\b', text_lower)
+        if named_folder_match:
+            folder_id = named_folder_match.group(1).strip()
 
     # ===== GROUPS =====
     # Leave groups
