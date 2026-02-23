@@ -937,6 +937,94 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
         total_text += f"❌ Die: {grand_die} | 🗑️ Đã xóa: {grand_deleted}"
         return total_text
 
+    if act == "verify_status":
+        # Smart contextual answer: actually check current state via API
+        topic = params.get("topic")  # "delete", "check", "count", or None
+        v_folder = params.get("folder_id")
+        v_profile = params.get("profile")
+        last_result = params.get("last_result", "")
+        question = params.get("original_question", "")
+        
+        # Case 1: Question about a folder ("fb3 xóa hết chưa?")
+        if v_folder:
+            # Actually call API to check CURRENT state
+            try:
+                lp = await call_fb_api("/list_profiles", data={"folder_id": v_folder, "page_size": 1})
+                current_count = 0
+                if "total" in lp:
+                    current_count = lp["total"]
+                elif "data" in lp:
+                    d = lp["data"]
+                    if isinstance(d, dict):
+                        current_count = d.get("meta", {}).get("total", len(d.get("content", [])))
+                    elif isinstance(d, list):
+                        current_count = len(d)
+            except Exception:
+                current_count = -1  # Error
+            
+            if topic == "delete":
+                if current_count == 0:
+                    return f"✅ Đã xóa sạch {v_folder} rồi bác! Hiện tại còn 0 profiles."
+                elif current_count > 0:
+                    return f"⚠️ Chưa hết bác ơi, {v_folder} vẫn còn {current_count} profiles. Bác muốn xóa tiếp không?"
+                else:
+                    return f"❌ Không kiểm tra được {v_folder}. Thử lại sau bac nhé."
+            elif topic == "check":
+                if current_count >= 0:
+                    return f"📊 {v_folder} hiện tại có {current_count} profiles."
+                else:
+                    return f"❌ Lỗi khi kiểm tra {v_folder}."
+            else:
+                # Generic question about folder
+                if current_count >= 0:
+                    return f"📊 {v_folder}: {current_count} profiles hiện tại."
+                # Fallback to last result
+                if last_result:
+                    return f"Kết quả gần nhất {v_folder}:\n{last_result[:300]}"
+                return f"Không check được {v_folder}. Bác thử gõ 'check {v_folder}' xem."
+        
+        # Case 2: Question about a profile ("S10 sao rồi?")
+        if v_profile:
+            if last_result:
+                return f"Kết quả {v_profile} lần trước:\n{last_result[:300]}"
+            return f"Chưa có thông tin về {v_profile}. Bác muốn check {v_profile} không?"
+        
+        # Case 3: No specific target — check all folders
+        if topic == "delete" or topic == "count":
+            try:
+                folders_result = await call_fb_api("/list_folders", data={})
+                folders = folders_result.get("folders", [])
+                if folders:
+                    text = "📊 Tình trạng hiện tại:\n\n"
+                    grand = 0
+                    for f in folders:
+                        fname = f.get("name", "?")
+                        fid = f.get("id", "?")
+                        try:
+                            lp2 = await call_fb_api("/list_profiles", data={"folder_id": str(fid), "page_size": 1})
+                            cnt = 0
+                            if "total" in lp2:
+                                cnt = lp2["total"]
+                            elif "data" in lp2:
+                                d2 = lp2["data"]
+                                if isinstance(d2, dict):
+                                    cnt = d2.get("meta", {}).get("total", len(d2.get("content", [])))
+                                elif isinstance(d2, list):
+                                    cnt = len(d2)
+                        except Exception:
+                            cnt = f.get("total_browser", 0)
+                        grand += cnt if isinstance(cnt, int) else 0
+                        text += f"• **{fname}** — {cnt} profiles\n"
+                    text += f"\n📊 Tổng: **{grand}** profiles"
+                    return text
+            except Exception:
+                pass
+        
+        # Fallback: show last result from history
+        if last_result:
+            return f"Kết quả gần nhất:\n{last_result[:300]}"
+        return "Chưa có kết quả nào trước đó bác ơi. Bác muốn check gì?"
+
     if act == "delete_all_profiles":
         folder_id = params.get("folder_id")
         if not folder_id:
@@ -1550,15 +1638,23 @@ def _get_last_context(chat_id: str) -> dict:
                 am = re.search(r'\b[aA]\s*(\d+)\b', content)
                 if am:
                     ctx["profile"] = f"A{am.group(1)}"
-        # Extract last action
+        # Extract last action (more precise detection)
         if not ctx["action"]:
-            for kw in ["delete_die", "batch_check", "check", "xóa", "list"]:
-                if kw in c_lower:
-                    ctx["action"] = kw
+            action_patterns = [
+                (r'xóa tất cả|xóa hết|xóa sạch|delete_all', 'delete_all'),
+                (r'xóa die|delete_die|đã xóa.*die', 'delete_die'),
+                (r'batch_check|check.*luồng|\d+ profiles', 'batch_check'),
+                (r'check|kiểm tra', 'check'),
+                (r'xóa|xoá|delete|dẹp', 'xóa'),
+                (r'list|danh sách|liệt kê', 'list'),
+            ]
+            for pattern, action_name in action_patterns:
+                if re.search(pattern, c_lower):
+                    ctx["action"] = action_name
                     break
         # Extract last result summary
         if not ctx["last_result"] and msg.get("role") == "assistant":
-            ctx["last_result"] = content[:200]
+            ctx["last_result"] = content[:300]
         if ctx["folder"] and ctx["profile"] and ctx["action"]:
             break
     return ctx
@@ -1878,16 +1974,31 @@ def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
     last_folder = ctx.get("folder")
     last_profile = ctx.get("profile")
     
-    # === QUESTION detection: "đã xóa hết chưa", "xong chưa", "xóa rồi chưa" ===
-    # If text contains QUESTION concept → treat as asking about result, not as an action
-    if "QUESTION" in concepts and len(text_lower) < 50:
-        # "đã xóa hết chưa" = asking about result, NOT requesting delete
-        last_result = ctx.get("last_result", "")
-        if last_result:
-            return {"action": "chat", "params": {}, "reply": f"Kết quả lần trước: {last_result[:300]}"}
-        return {"action": "chat", "params": {}, "reply": "Chưa có kết quả trước đó bác ơi. Bác muốn check gì?"}
+    # === QUESTION / RESULT detection ===
+    # "đã xóa hết chưa", "xong chưa", "sao rồi" → VERIFY real state, not just copy old text
+    if ("QUESTION" in concepts or "RESULT" in concepts) and len(text_lower) < 60:
+        # Detect WHAT the question is about from concepts + history
+        question_topic = None
+        if "REMOVE" in concepts or ctx.get("action") in ("xóa", "delete_die", "delete_all"):
+            question_topic = "delete"
+        elif "CHECK" in concepts or ctx.get("action") in ("batch_check", "check"):
+            question_topic = "check"
+        elif "COUNT" in concepts or ctx.get("action") == "list":
+            question_topic = "count"
+        
+        # Use folder from question text first, then from context
+        verify_folder = folder_id or last_folder
+        verify_profile = profile or last_profile
+        
+        return {"action": "verify_status", "params": {
+            "topic": question_topic,
+            "folder_id": verify_folder,
+            "profile": verify_profile,
+            "original_question": text_lower,
+            "last_result": ctx.get("last_result", ""),
+        }, "reply": "🔍 Đang kiểm tra..."}
     
-    # Pure follow-up: only CONFIRM/RETRY/RESULT concepts, nothing else substantive
+    # Pure follow-up: only CONFIRM/RETRY concepts, nothing else substantive
     action_concepts = concepts - {"CONFIRM", "RETRY", "RESULT", "QUESTION", "ALL", "KEEP", "LIVE"}
     
     if len(text_lower) < 40 and not action_concepts:
@@ -1903,13 +2014,6 @@ def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
             if last_folder:
                 return {"action": "delete_die_all", "params": {"concurrency": 10}, "reply": "🔄 Chạy lại..."}
             return None
-        
-        # "rồi sao?", "xong chưa?", "kết quả?"
-        if "RESULT" in concepts or text_lower.strip('?!. ') == '':
-            last_result = ctx.get("last_result", "")
-            if last_result:
-                return {"action": "chat", "params": {}, "reply": f"Kết quả lần trước: {last_result[:300]}"}
-            return {"action": "chat", "params": {}, "reply": "Chưa có kết quả nào trước đó bác ơi. Bác muốn check gì?"}
     
     # Short "xóa/remove" without explicit target → from context
     if len(text_lower) < 30 and "REMOVE" in concepts and not folder_id and not profile:
