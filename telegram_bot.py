@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 FB Manager Pro Telegram Bot — NLP-powered.
-Primary: Pollinations.ai openai (OpenAI GPT-5 Mini, smart & affordable)
+Primary: Pollinations.ai rotation (GPT-5 Mini → DeepSeek V3.2 → Claude Haiku 4.5 → Mistral 3.2 → GPT-5 Nano)
 Fallback: JanAI Devstral-24B (local, FREE)
 Understands natural language like "s10 thoát hết nhóm" and executes FB Manager actions.
 """
@@ -26,13 +26,49 @@ sys.stdout.reconfigure(encoding='utf-8')
 TELEGRAM_BOT_TOKEN = "6891995669:AAHOlqrRiSoNzI1FcyqWemvpo5ZRxV4AKDI"
 FB_MANAGER_API = "http://127.0.0.1:8899"
 
-# Pollinations.ai (primary) — openai = OpenAI GPT-5 Mini
-# 700 responses/pollen, 0.15/M input, 0.6/M output — smart & affordable
+# Pollinations.ai — Model rotation pool (smart → fast → cheap)
+# When one model hits rate limit, auto-rotate to next
 POLLINATIONS_API = "https://gen.pollinations.ai/v1"
 POLLINATIONS_KEY = "sk_3HRi9HUGLup7OKB6ykRds8YtnpcmLHD3"
-POLLINATIONS_MODEL = "openai"  # OpenAI GPT-5 Mini
 
-# JanAI local (fallback) — Devstral-24B, FREE, no internet needed
+# Model pool: ordered by intelligence (best first)
+POLLINATIONS_MODELS = [
+    {"model": "openai",      "name": "GPT-5 Mini",        "timeout": 30},   # Best overall
+    {"model": "deepseek",    "name": "DeepSeek V3.2",     "timeout": 40},   # Great reasoning
+    {"model": "claude-fast", "name": "Claude Haiku 4.5",  "timeout": 30},   # Very accurate
+    {"model": "mistral",     "name": "Mistral Small 3.2", "timeout": 30},   # Good & cheap
+    {"model": "openai-fast", "name": "GPT-5 Nano",        "timeout": 25},   # Fast backup
+]
+
+# Track current model index + cooldowns
+import time as _time
+_model_index = 0  # Start with best model
+_model_cooldowns = {}  # model_name -> cooldown_until timestamp
+
+def _get_next_model() -> dict:
+    """Get next available model, skipping ones on cooldown."""
+    global _model_index
+    now = _time.time()
+    for _ in range(len(POLLINATIONS_MODELS)):
+        m = POLLINATIONS_MODELS[_model_index % len(POLLINATIONS_MODELS)]
+        cooldown_until = _model_cooldowns.get(m["model"], 0)
+        if now >= cooldown_until:
+            return m
+        _model_index = (_model_index + 1) % len(POLLINATIONS_MODELS)
+    # All on cooldown — return first one anyway (cooldown may have expired)
+    _model_cooldowns.clear()
+    return POLLINATIONS_MODELS[0]
+
+def _rotate_model(failed_model: str, cooldown_secs: int = 60):
+    """Put failed model on cooldown and rotate to next."""
+    global _model_index
+    _model_cooldowns[failed_model] = _time.time() + cooldown_secs
+    _model_index = (_model_index + 1) % len(POLLINATIONS_MODELS)
+    next_m = _get_next_model()
+    logger.warning(f"🔄 Rotated from {failed_model} → {next_m['name']} (cooldown {cooldown_secs}s)")
+    return next_m
+
+# JanAI local (last resort fallback) — Devstral-24B, FREE, no internet needed
 JANAI_API = "http://127.0.0.1:1337/v1"
 DEVSTRAL_MODEL = "Devstral-Small-2-24B-Instruct-2512-IQ4_XS"
 
@@ -167,41 +203,68 @@ IMPORTANT:
 
 
 # ============================================================
-# AI providers (Pollinations primary, JanAI fallback)
+# AI providers (Pollinations rotation + JanAI fallback)
 # ============================================================
 async def call_pollinations(messages: list, max_tokens: int = 300, temperature: float = 0.1) -> str:
-    """Call Pollinations.ai (openai = OpenAI GPT-5 Mini). Smart & affordable."""
-    try:
-        async with aiohttp.ClientSession() as session:
-            payload = {
-                "model": POLLINATIONS_MODEL,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "stream": False
-            }
-            headers = {
-                "Authorization": f"Bearer {POLLINATIONS_KEY}",
-                "Content-Type": "application/json"
-            }
-            async with session.post(
-                f"{POLLINATIONS_API}/chat/completions",
-                json=payload,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    content = data["choices"][0]["message"]["content"]
-                    logger.info(f"Pollinations OK ({POLLINATIONS_MODEL})")
-                    return content
-                else:
-                    error_text = await resp.text()
-                    logger.warning(f"Pollinations {resp.status}: {error_text[:200]}")
-                    return None  # Signal to try fallback
-    except Exception as e:
-        logger.warning(f"Pollinations error: {e}")
-        return None  # Signal to try fallback
+    """Call Pollinations.ai with auto-rotation across 5 models.
+    On rate limit (429) or error, rotate to next model and retry."""
+    tried = set()
+    
+    while len(tried) < len(POLLINATIONS_MODELS):
+        model_info = _get_next_model()
+        model_id = model_info["model"]
+        
+        if model_id in tried:
+            _rotate_model(model_id, cooldown_secs=30)
+            continue
+        tried.add(model_id)
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                payload = {
+                    "model": model_id,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "stream": False
+                }
+                headers = {
+                    "Authorization": f"Bearer {POLLINATIONS_KEY}",
+                    "Content-Type": "application/json"
+                }
+                timeout = aiohttp.ClientTimeout(total=model_info.get("timeout", 30))
+                async with session.post(
+                    f"{POLLINATIONS_API}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                    timeout=timeout
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        content = data["choices"][0]["message"]["content"]
+                        logger.info(f"✅ Pollinations OK [{model_info['name']}]")
+                        return content
+                    elif resp.status == 429:
+                        # Rate limited — rotate to next model
+                        logger.warning(f"⚠️ {model_info['name']} rate limited (429)")
+                        _rotate_model(model_id, cooldown_secs=120)
+                        continue
+                    else:
+                        error_text = await resp.text()
+                        logger.warning(f"⚠️ {model_info['name']} error {resp.status}: {error_text[:150]}")
+                        _rotate_model(model_id, cooldown_secs=60)
+                        continue
+        except asyncio.TimeoutError:
+            logger.warning(f"⏰ {model_info['name']} timeout")
+            _rotate_model(model_id, cooldown_secs=60)
+            continue
+        except Exception as e:
+            logger.warning(f"❌ {model_info['name']} error: {e}")
+            _rotate_model(model_id, cooldown_secs=60)
+            continue
+    
+    logger.error("All Pollinations models failed!")
+    return None  # Signal to try JanAI fallback
 
 
 async def call_janai(messages: list, max_tokens: int = 500, temperature: float = 0.3) -> str:
@@ -235,11 +298,11 @@ async def call_janai(messages: list, max_tokens: int = 500, temperature: float =
 
 
 async def call_ai(messages: list, max_tokens: int = 300, temperature: float = 0.1) -> str:
-    """Try Pollinations first (fast, cheap), fallback to JanAI (local, free)."""
+    """Try Pollinations rotation (5 models), fallback to JanAI (local, free)."""
     result = await call_pollinations(messages, max_tokens, temperature)
     if result is not None:
         return result
-    logger.info("Falling back to JanAI...")
+    logger.info("All Pollinations models exhausted, falling back to JanAI...")
     return await call_janai(messages, max_tokens, temperature)
 
 
@@ -1545,7 +1608,7 @@ def main():
     # NLP text handler (catches everything else)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     
-    logger.info("🚀 Bot started (Pollinations GPT-5 Mini + JanAI fallback + FB Manager Pro)")
+    logger.info("🚀 Bot started (Pollinations 5-model rotation + JanAI fallback + FB Manager Pro)")
     app.run_polling(drop_pending_updates=True)
 
 
