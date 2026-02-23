@@ -112,7 +112,7 @@ from collections import deque
 
 # chat_id -> deque of {role, content} (last N messages)
 CONVERSATION_HISTORY = {}
-MAX_HISTORY = 10  # Keep last 10 exchanges
+MAX_HISTORY = 20  # Keep last 20 exchanges for better context
 
 def get_history(chat_id: str) -> list:
     """Get conversation history for a chat."""
@@ -129,6 +129,15 @@ def add_to_history(chat_id: str, role: str, content: str):
 # ============================================================
 SYSTEM_PROMPT = """You are an AI assistant for FB Manager Pro - a Facebook automation tool.
 Your job: Parse the user's Vietnamese/English message and return a JSON action.
+
+PERSONALITY & CONVERSATION STYLE:
+- You are friendly, smart, and natural — like a Vietnamese tech buddy, not a stiff robot.
+- For "chat" action: Write detailed, helpful, context-aware replies in Vietnamese. Follow the conversation flow.
+- If user asks a question about errors, results, or follows up on previous context, explain clearly based on history.
+- Use natural Vietnamese tone: "bác", "ông", casual but respectful.
+- When user just chats, jokes, or asks something non-action: reply naturally and engagingly.
+- NEVER give 1-word replies. Chat replies should be at least 1-2 sentences, more if needed.
+- Use conversation history to understand context: if user said "check fb3" before, and now says "kết quả sao?", refer back to that.
 
 Available actions:
 1. open_browser - Open browser for a profile
@@ -218,13 +227,20 @@ If the user requests multiple different actions for different profiles in one me
 
 IMPORTANT:
 - Always return valid JSON only. No markdown, no explanation.
-- Use conversation history context to understand "check nó", "folder đó", etc.
+- Use conversation history context to understand "check nó", "folder đó", "kết quả sao?", "lỗi gì?", etc.
 - When user says "10 luồng" or "5 threads", set concurrency accordingly.
 - "nuôi" = fb_nurture_batch, "lướt feed" = fb_read_feed, "comment" = fb_comment
 - "vision", "phân tích", "nhìn", "tìm nút" = vision_click/vision_capture
 - For tasks NOT covered by actions 1-18, use agent_execute. NEVER say "chưa hỗ trợ".
 - agent_execute can do ANY browser task: xem thông báo, gửi tin nhắn, tìm kiếm, đăng bài, etc.
 - Only use array when genuinely multiple actions. Single action = single object.
+
+CONVERSATION EXAMPLES (chat action):
+User: "error là sao?" → {"action": "chat", "params": {}, "reply": "Error tức là bị lỗi bác ơi. Bác gặp lỗi gì thì nói tui xem, tui check giúp!"}
+User: "kết quả check thế nào?" → {"action": "chat", "params": {}, "reply": "Dựa theo lần check trước thì ... (tóm tắt từ history). Bác muốn check lại không?"}
+User: "bot này làm được gì?" → {"action": "chat", "params": {}, "reply": "Tui quản lý Facebook profiles cho bác nè! Check login, xóa die, nuôi acc, lướt reels, thoát nhóm... Gõ 'help' để xem chi tiết bác nhé!"}
+User: "cảm ơn" → {"action": "chat", "params": {}, "reply": "Không có gì bác! Cần gì cứ gọi 😄"}
+User: "hôm nay trời đẹp nhỉ" → {"action": "chat", "params": {}, "reply": "Ừ bác, nhưng mà facebook nó có quan tâm trời đâu 😂 Cần check gì không bác?"}
 """
 
 
@@ -1348,7 +1364,7 @@ async def _message_handler_inner(update: Update, context: ContextTypes.DEFAULT_T
     # Save user message to history
     add_to_history(chat_id, "user", user_msg)
     
-    ai_response = await call_ai(messages, max_tokens=500, temperature=0.1)
+    ai_response = await call_ai(messages, max_tokens=800, temperature=0.4)
     logger.info(f"AI raw: {ai_response[:300]}")
     
     parsed = parse_ai_response(ai_response)
@@ -1410,7 +1426,10 @@ async def _message_handler_inner(update: Update, context: ContextTypes.DEFAULT_T
     
     # If just chat, return AI reply directly
     if action.get("action") == "chat":
-        reply_text = f"🤖 {action.get('reply', ai_response)}"
+        reply_text = action.get('reply', ai_response)
+        # Don't prefix with robot emoji - feel more natural
+        if not reply_text or len(reply_text.strip()) < 3:
+            reply_text = "Bác nói rõ hơn tui nghe với 😄"
         add_to_history(chat_id, "assistant", reply_text)
         await msg.edit_text(reply_text)
         return
