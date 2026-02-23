@@ -278,6 +278,11 @@ async def call_pollinations(messages: list, max_tokens: int = 300, temperature: 
                     if resp.status == 200:
                         data = await resp.json()
                         content = data["choices"][0]["message"]["content"]
+                        if not content or not content.strip():
+                            # Empty response — try next key/model
+                            logger.warning(f"⚠️ Empty response [{key_info['name']}] [{model_info['name']}]")
+                            _rotate_key(key_info["key"], cooldown_secs=30)
+                            continue
                         logger.info(f"✅ AI OK [{model_info['name']}] [{key_info['name']}]")
                         return content
                     elif resp.status == 429:
@@ -1529,6 +1534,12 @@ def try_quick_parse(text: str) -> dict | None:
     
     if profile and re.search(r'vision.*capture|chụp.*vision|phân tích.*dom|phân tích.*giao diện|analyze', text_lower):
         return {"action": "vision_capture", "params": {"profile": profile}, "reply": f"📸 Đang chụp vision {profile}..."}
+
+    # ===== CHECK + DELETE DIE (combo: "fb3 10 luồng die thì xóa") =====
+    if folder_id and re.search(r'die.*xóa|xóa.*die|die.*thì.*xóa|check.*xóa|xóa.*chết', text_lower):
+        conc_match = re.search(r'(\d+)\s*(?:luồng|thread|worker)', text_lower)
+        concurrency = int(conc_match.group(1)) if conc_match else 5
+        return {"action": "delete_die_profiles", "params": {"folder_id": folder_id, "concurrency": concurrency}, "reply": f"🗑️ Đang check {folder_id} ({concurrency} luồng) rồi xóa die..."}
 
     # ===== DELETE DIE PROFILES =====
     if re.search(r'xóa.*die|delete.*die|xóa.*chết|dọn.*die|xoá.*die', text_lower):
