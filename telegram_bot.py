@@ -127,40 +127,41 @@ def add_to_history(chat_id: str, role: str, content: str):
 # ============================================================
 # SYSTEM PROMPT for NLP intent parsing
 # ============================================================
-SYSTEM_PROMPT = """You are AI CUTE - a Vietnamese AI assistant for FB Manager Pro (Facebook profile manager).
-Parse user message → return JSON action. NEVER return plain text.
+SYSTEM_PROMPT = """Bạn là AI CUTE - bộ não thông minh quản lý Facebook profiles. Bạn NGHĨ như con người, HIỂU ngữ cảnh, TỰ QUYẾT ĐỊNH và HÀNH ĐỘNG.
 
-CORE RULES:
-1. ALWAYS return valid JSON: {"action": "...", "params": {...}, "reply": "..."}
-2. Use conversation history to resolve "nó", "cái đó", "folder kia", etc.
-3. When user wants action (xóa/check/mở...) → return action, NEVER just chat about it
-4. Short follow-ups ("xóa đi", "làm luôn") → infer from history, execute
-5. Never ask "chọn 1,2,3" — just DO the best action
+TÍNH CÁCH: Nói chuyện tự nhiên, gọn, hài hước nhẹ. Xưng "tui", gọi user "bác".
 
-ACTIONS (key ones):
-- delete_die_all: Check ALL folders, delete DIE profiles {"concurrency": N}
-- delete_die_profiles: Check+delete DIE in 1 folder {"folder_id": "fb3", "concurrency": N}
-- batch_check_login: Check login status of folder {"folder_id": "fb1", "concurrency": N}
-- list_folders: List folders + counts
-- list_profiles: List profiles in folder {"folder_id": "fb1"}
+NGUYÊN TẮC BỘ NÃO:
+1. LUÔN trả JSON: {"action": "...", "params": {...}, "reply": "..."}
+2. HIỂU NGỮ CẢNH: Dùng history để hiểu "nó", "cái đó", "folder kia", "tiếp đi"
+3. TỰ QUYẾT ĐỊNH: User muốn gì → PHÂN TÍCH → CHỌN action tốt nhất → LÀM
+4. KHÔNG HỎI LẠI: Đừng hỏi "bác muốn làm gì" - tự suy luận rồi làm
+5. CÂU PHỨC HỢP: "xóa chưa? chưa thì xóa đi" → HIỂU là: check + nếu chưa xong thì làm
+6. THEO DÕI: Nhớ mình đã làm gì, trả lời thông minh khi user hỏi kết quả
+
+ACTIONS:
+- delete_all_profiles: Xóa TẤT CẢ profiles (không check) {"folder_id": "fb3"}
+- delete_die_all: Check ALL folders, xóa DIE {"concurrency": N}
+- delete_die_profiles: Check+xóa DIE 1 folder {"folder_id": "fb3", "concurrency": N}
+- batch_check_login: Check login {"folder_id": "fb1", "concurrency": N}
+- list_folders: Xem folders + số lượng
+- list_profiles: Xem profiles {"folder_id": "fb1"}
 - open_browser/close_browser: {"profile": "S10"}
-- check_fb_status: Full check 1 profile {"profile": "S10"}
-- leave_groups/debug_groups: {"profile": "S10"}
-- watch_reels: {"profile": "S10", "count": 5, "comment": true}
-- fb_nurture_batch: {"profiles": [...], "max_workers": 3}
-- agent_execute: ANY browser task {"profile": "S10", "task": "description"}
-- chat: Just talking, no action {"reply": "..."}
+- check_fb_status: Check 1 profile {"profile": "S10"}
+- leave_groups: Thoát groups {"profile": "S10"}
+- watch_reels: Xem reels {"profile": "S10", "count": 5}
+- fb_nurture_batch: Nuôi accounts {"profiles": [...], "max_workers": 3}
+- agent_execute: Bất kỳ task browser {"profile": "S10", "task": "mô tả"}
+- chat: Chỉ trò chuyện {"reply": "..."}
 
-VIETNAMESE INTENT MAP:
-- "check/kiểm tra toàn bộ" + "die xóa/live giữ" → delete_die_all
-- "còn bao nhiêu/tổng" → list_folders
-- "xóa hết/xóa luôn/xóa đi" (after check) → delete from context
-- "nuôi/dưỡng" → fb_nurture_batch
-- "luồng/thread" → concurrency param
-- fb1/fb2/fb3 = folder names, S10/A200 = profile names
+MAPPING:
+- fb1/fb2/fb3 = folder, S10/A200 = profile
+- "hết/tất cả" + "xóa" (không nói die) → delete_all_profiles
+- "xóa die" → delete_die_profiles
+- "bao nhiêu/còn mấy" → list_folders
+- "luồng/thread" = concurrency
 
-OUTPUT FORMAT: {"action": "NAME", "params": {}, "reply": "Việt namếse reply"}
-For chat: {"action": "chat", "params": {}, "reply": "Friendly Vietnamese reply"}
+OUTPUT: {"action": "NAME", "params": {}, "reply": "Vietnamese reply"}
 """
 
 
@@ -1085,14 +1086,34 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
             except Exception as e:
                 errors.append(f"Batch {i//50+1}: {e}")
 
+        # Auto-verify: check remaining count after deletion
+        remaining = -1
+        try:
+            verify = await call_fb_api("/list_profiles", data={"folder_id": folder_id, "page_size": 1})
+            if "total" in verify:
+                remaining = verify["total"]
+            elif "data" in verify:
+                d = verify["data"]
+                if isinstance(d, dict):
+                    remaining = d.get("meta", {}).get("total", len(d.get("content", [])))
+                elif isinstance(d, list):
+                    remaining = len(d)
+        except Exception:
+            pass
+
         text = f"🗑️ **Xóa TẤT CẢ profiles - {folder_id}**\n\n"
-        text += f"📊 Tổng: {total} profiles\n"
+        text += f"📊 Trước: {total} profiles\n"
         text += f"🗑️ **Đã xóa: {deleted_total}**\n"
         if errors:
             text += f"\n⚠️ Lỗi:\n"
             for err in errors[:5]:
                 text += f"• {err}\n"
-        if deleted_total > 0:
+        # Self-monitoring: report actual remaining
+        if remaining == 0:
+            text += f"\n✅ Xóa sạch {folder_id}! Còn 0 profiles."
+        elif remaining > 0:
+            text += f"\n⚠️ Vẫn còn {remaining} profiles trong {folder_id}."
+        elif deleted_total > 0:
             text += f"\n✅ Xóa sạch {folder_id}!"
         return text
 
@@ -1178,8 +1199,23 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
         del_result = await call_fb_api("/delete_profiles", data={"uuids": die_uuids})
         deleted = del_result.get("deleted", 0)
 
+        # Auto-verify: check remaining count after deletion
+        remaining = -1
+        try:
+            verify = await call_fb_api("/list_profiles", data={"folder_id": folder_id, "page_size": 1})
+            if "total" in verify:
+                remaining = verify["total"]
+            elif "data" in verify:
+                d = verify["data"]
+                if isinstance(d, dict):
+                    remaining = d.get("meta", {}).get("total", len(d.get("content", [])))
+                elif isinstance(d, list):
+                    remaining = len(d)
+        except Exception:
+            pass
+
         text = f"🗑️ **Xóa DIE - {folder_id}**\n\n"
-        text += f"📊 Tổng: {total} profiles\n"
+        text += f"📊 Trước: {total} profiles\n"
         text += f"✅ Live: {live_count}\n"
         if locked_count:
             text += f"🔒 Locked: {locked_count}\n"
@@ -1189,6 +1225,9 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
             text += f"• `{n}`\n"
         if len(die_names) > 20:
             text += f"... +{len(die_names)-20} khác\n"
+        # Self-monitoring: report actual remaining
+        if remaining >= 0:
+            text += f"\n📊 **Còn lại: {remaining} profiles** trong {folder_id}"
         return text
 
     # ===== FEED =====
@@ -1604,11 +1643,15 @@ async def _message_handler_inner(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         logger.warning(f"edit_text reply failed: {e}")
     result = await execute_action(action, telegram_chat_id=chat_id, telegram_message_id=msg.message_id)
-    # Save result summary to history — but keep it short to avoid AI copying raw output
+    # Save structured result to history for smarter context tracking
     act_name = action.get('action', 'unknown')
+    act_params = action.get('params', {})
     if act_name == 'agent_execute':
-        # Don't pollute history with agent raw output (AI copies it)
-        add_to_history(chat_id, "assistant", f"[Agent done: {action.get('params',{}).get('task','')}]")
+        add_to_history(chat_id, "assistant", f"[Agent done: {act_params.get('task','')}]")
+    elif act_name in ('delete_all_profiles', 'delete_die_profiles', 'delete_die_all'):
+        # Save with action metadata so follow-up questions know what was done
+        folder = act_params.get('folder_id', 'all')
+        add_to_history(chat_id, "assistant", f"[{act_name}:{folder}] {result[:250] if result else 'Done'}")
     else:
         add_to_history(chat_id, "assistant", result[:300] if result else "Done")
     try:
@@ -1650,20 +1693,34 @@ def _get_last_context(chat_id: str) -> dict:
                 am = re.search(r'\b[aA]\s*(\d+)\b', content)
                 if am:
                     ctx["profile"] = f"A{am.group(1)}"
-        # Extract last action (more precise detection)
+        # Extract last action (structured metadata first, then regex fallback)
         if not ctx["action"]:
-            action_patterns = [
-                (r'xóa tất cả|xóa hết|xóa sạch|delete_all', 'delete_all'),
-                (r'xóa die|delete_die|đã xóa.*die', 'delete_die'),
-                (r'batch_check|check.*luồng|\d+ profiles', 'batch_check'),
-                (r'check|kiểm tra', 'check'),
-                (r'xóa|xoá|delete|dẹp', 'xóa'),
-                (r'list|danh sách|liệt kê', 'list'),
-            ]
-            for pattern, action_name in action_patterns:
-                if re.search(pattern, c_lower):
-                    ctx["action"] = action_name
-                    break
+            # Structured format: [delete_all_profiles:fb3] ...
+            meta_match = re.match(r'\[(delete_all_profiles|delete_die_profiles|delete_die_all|batch_check_login|list_folders):([^\]]*)\]', content)
+            if meta_match:
+                action_map = {
+                    'delete_all_profiles': 'delete_all',
+                    'delete_die_profiles': 'delete_die',
+                    'delete_die_all': 'delete_die',
+                    'batch_check_login': 'batch_check',
+                    'list_folders': 'list',
+                }
+                ctx["action"] = action_map.get(meta_match.group(1), meta_match.group(1))
+                if not ctx["folder"] and meta_match.group(2) != 'all':
+                    ctx["folder"] = meta_match.group(2)
+            else:
+                action_patterns = [
+                    (r'xóa tất cả|xóa hết|xóa sạch|delete_all', 'delete_all'),
+                    (r'xóa die|delete_die|đã xóa.*die', 'delete_die'),
+                    (r'batch_check|check.*luồng|\d+ profiles', 'batch_check'),
+                    (r'check|kiểm tra', 'check'),
+                    (r'xóa|xoá|delete|dẹp', 'xóa'),
+                    (r'list|danh sách|liệt kê', 'list'),
+                ]
+                for pattern, action_name in action_patterns:
+                    if re.search(pattern, c_lower):
+                        ctx["action"] = action_name
+                        break
         # Extract last result summary
         if not ctx["last_result"] and msg.get("role") == "assistant":
             ctx["last_result"] = content[:300]
