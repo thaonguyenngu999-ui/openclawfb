@@ -237,10 +237,19 @@ IMPORTANT:
 
 CONVERSATION EXAMPLES (chat action):
 User: "error là sao?" → {"action": "chat", "params": {}, "reply": "Error tức là bị lỗi bác ơi. Bác gặp lỗi gì thì nói tui xem, tui check giúp!"}
-User: "kết quả check thế nào?" → {"action": "chat", "params": {}, "reply": "Dựa theo lần check trước thì ... (tóm tắt từ history). Bác muốn check lại không?"}
 User: "bot này làm được gì?" → {"action": "chat", "params": {}, "reply": "Tui quản lý Facebook profiles cho bác nè! Check login, xóa die, nuôi acc, lướt reels, thoát nhóm... Gõ 'help' để xem chi tiết bác nhé!"}
 User: "cảm ơn" → {"action": "chat", "params": {}, "reply": "Không có gì bác! Cần gì cứ gọi 😄"}
-User: "hôm nay trời đẹp nhỉ" → {"action": "chat", "params": {}, "reply": "Ừ bác, nhưng mà facebook nó có quan tâm trời đâu 😂 Cần check gì không bác?"}
+
+FOLLOW-UP ACTION EXAMPLES (CRITICAL - DO NOT just "chat" for these):
+User previously checked fb3, now says "xóa hết" → {"action": "delete_die_profiles", "params": {"folder_id": "fb3"}, "reply": "🗑️ Đang xóa die fb3..."}
+User says "xóa đi", "xóa luôn", "delete nó" after any check → {"action": "delete_die_profiles", "params": {"folder_id": "<folder from context>"}, "reply": "🗑️ Xóa die..."}
+User says "xóa toàn bộ", "xóa hết luôn" → {"action": "delete_die_all", "params": {}, "reply": "🗑️ Xóa die toàn bộ..."}
+User says "rồi sao", "xong chưa", "kết quả" after action → {"action": "chat", "params": {}, "reply": "<summarize result from history>"}
+User says "check lại", "làm lại" → RE-RUN the previous action from history
+
+RULE: When user requests an action (xóa, check, mở...), ALWAYS return an action JSON, NEVER just chat about it.
+RULE: If user says short commands like "xóa", "xóa hết", "xóa đi", "delete" → find folder/profile from conversation history and execute.
+RULE: Never ask "bác chọn 1, 2 hay 3" — just DO the most logical action.
 """
 
 
@@ -881,6 +890,10 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
             text += f"\n**⚠️ Lỗi ({len(error_list)}):**\n"
             for e in error_list[:10]:
                 text += f"• `{e}`\n"
+        
+        # Suggest next action if die found
+        if die_list:
+            text += f"\n💡 Gõ **'xóa die {folder_id}'** để xóa {len(die_list)} profiles die"
         return text
 
     # ===== DELETE DIE PROFILES =====
@@ -921,13 +934,20 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
                 except Exception:
                     pass
 
-            # Get profiles in this folder
+            # Get profiles in this folder (with retry on SQLITE_ERROR)
             list_result = await call_fb_api("/list_profiles", data={"folder_id": str(fid), "page_size": 300})
+            if "error" in list_result:
+                # Retry once after short delay (SQLITE_ERROR can be transient)
+                await asyncio.sleep(2)
+                list_result = await call_fb_api("/list_profiles", data={"folder_id": str(fid), "page_size": 300})
+            if "error" in list_result:
+                total_text += f"📁 **{fname}**: ⚠️ Lỗi: {list_result['error'][:60]}\n"
+                continue
             profiles_list = list_result.get("data", [])
             if isinstance(profiles_list, dict):
                 profiles_list = profiles_list.get("content", [])
             if not profiles_list:
-                total_text += f"📁 **{fname}**: 0 profiles\n"
+                total_text += f"📁 **{fname}**: ⚠️ API trả về 0 (nhưng folder có {ftotal})\n"
                 continue
 
             profile_names = [p.get("name", "") for p in profiles_list if p.get("name")]
@@ -1362,7 +1382,7 @@ async def _message_handler_inner(update: Update, context: ContextTypes.DEFAULT_T
     chat_id = str(update.effective_chat.id)
 
     # Quick pattern matching for common commands (no AI needed)
-    quick = try_quick_parse(user_msg)
+    quick = try_quick_parse(user_msg, chat_id=chat_id)
     if quick:
         logger.info(f"Quick parse: {quick}")
         # Save to history so AI has context
@@ -1484,9 +1504,36 @@ async def _message_handler_inner(update: Update, context: ContextTypes.DEFAULT_T
             logger.warning(f"edit_text result failed: {e2}")
 
 
-def try_quick_parse(text: str) -> dict | None:
+def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
     """Fast regex-based intent detection for common patterns (skip AI call)."""
     text_lower = text.lower().strip()
+    
+    # ===== FOLLOW-UP SHORT COMMANDS (xóa hết, xóa đi, xóa luôn, delete) =====
+    # These need conversation history to determine what folder/profile
+    if re.search(r'^(xóa|xoá|delete|dọn|hết|xóa hết|xóa đi|xóa luôn|xóa ngay|xoá hết|xoá luôn|xóa die|xóa chết)\s*$', text_lower):
+        # Short "xóa" command — find folder from recent history
+        if chat_id:
+            history = get_history(chat_id)
+            last_folder = None
+            for msg in reversed(history):
+                content = msg.get("content", "")
+                # Look for folder references in recent messages
+                fm = re.search(r'fb\s*(\d+)', content.lower())
+                if fm:
+                    last_folder = f"fb{fm.group(1)}"
+                    break
+                # Also check for folder names in results
+                for fname in ['FB1', 'FB2', 'FB3', 'FB OK', 'Đông Hưng']:
+                    if fname.lower() in content.lower():
+                        folder_map = {'fb1': 'fb1', 'fb2': 'fb2', 'fb3': 'fb3', 'fb ok': 'fb5', 'đông hưng': 'fb7'}
+                        last_folder = folder_map.get(fname.lower())
+                        break
+                if last_folder:
+                    break
+            if last_folder:
+                return {"action": "delete_die_profiles", "params": {"folder_id": last_folder, "concurrency": 10}, "reply": f"🗑️ Đang xóa die {last_folder}..."}
+            else:
+                return {"action": "delete_die_all", "params": {"concurrency": 10}, "reply": "🗑️ Đang xóa die toàn bộ..."}
     
     # Extract profile names (S10, s10, S 10, A100, a100, etc.)
     profile_matches = re.findall(r'\b[sS]\s*(\d+)\b', text)
