@@ -1504,6 +1504,21 @@ async def _message_handler_inner(update: Update, context: ContextTypes.DEFAULT_T
             logger.warning(f"edit_text result failed: {e2}")
 
 
+def _extract_concurrency(text_lower: str, default: int = 5) -> int:
+    """Extract concurrency/thread count from text. Matches: '20 luồng', 'bật 20', 'mở 20 thread', etc."""
+    # Pattern 1: "N luồng/thread/worker"
+    m = re.search(r'(\d+)\s*(?:luồng|thread|worker|threads|workers)', text_lower)
+    if m:
+        return int(m.group(1))
+    # Pattern 2: "bật/mở N" (before luồng concept)
+    m = re.search(r'(?:bật|mở|chạy|dùng|set)\s+(\d+)', text_lower)
+    if m:
+        val = int(m.group(1))
+        if 2 <= val <= 100:  # sanity check: not a profile number
+            return val
+    return default
+
+
 def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
     """Fast regex-based intent detection for common patterns (skip AI call)."""
     text_lower = text.lower().strip()
@@ -1608,8 +1623,7 @@ def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
     
     # Batch check login (folder-level)
     if folder_id and re.search(r'check|kiểm tra|bao nhiêu.*live|live.*die|die.*live', text_lower):
-        conc_match = re.search(r'(\d+)\s*(?:luồng|thread|worker)', text_lower)
-        concurrency = int(conc_match.group(1)) if conc_match else 5
+        concurrency = _extract_concurrency(text_lower)
         return {"action": "batch_check_login", "params": {"folder_id": folder_id, "concurrency": concurrency}, "reply": f"🔍 Đang check {folder_id} ({concurrency} luồng)..."}
 
     # ===== SCREENSHOT =====
@@ -1630,8 +1644,7 @@ def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
 
     # ===== CHECK + DELETE DIE (combo: "fb3 10 luồng die thì xóa" or "check toàn bộ die xóa") =====
     if re.search(r'die.*xóa|xóa.*die|die.*thì.*xóa|check.*xóa|xóa.*chết|die.*thì.*xoá', text_lower):
-        conc_match = re.search(r'(\d+)\s*(?:luồng|thread|worker)', text_lower)
-        concurrency = int(conc_match.group(1)) if conc_match else 5
+        concurrency = _extract_concurrency(text_lower)
         is_all = re.search(r'toàn bộ|tất cả|all|hết|mọi|every', text_lower)
         if folder_id and not is_all:
             return {"action": "delete_die_profiles", "params": {"folder_id": folder_id, "concurrency": concurrency}, "reply": f"🗑️ Đang check {folder_id} ({concurrency} luồng) rồi xóa die..."}
@@ -1640,8 +1653,7 @@ def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
 
     # ===== DELETE DIE PROFILES =====
     if re.search(r'xóa.*die|delete.*die|xóa.*chết|dọn.*die|xoá.*die', text_lower):
-        conc_match = re.search(r'(\d+)\s*(?:luồng|thread|worker)', text_lower)
-        concurrency = int(conc_match.group(1)) if conc_match else 5
+        concurrency = _extract_concurrency(text_lower)
         # Check if user wants ALL folders
         if re.search(r'toàn bộ|tất cả|all|hết|mọi|every', text_lower):
             return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🗑️ Đang check & xóa die TOÀN BỘ ({concurrency} luồng)..."}
@@ -1661,8 +1673,7 @@ def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
 
     # ===== CHECK TOÀN BỘ (without die/xóa → just batch check all) =====
     if re.search(r'check.*toàn bộ|check.*tất cả|check.*all|kiểm tra.*toàn bộ|kiểm tra.*tất cả', text_lower) and not folder_id:
-        conc_match = re.search(r'(\d+)\s*(?:luồng|thread|worker)', text_lower)
-        concurrency = int(conc_match.group(1)) if conc_match else 5
+        concurrency = _extract_concurrency(text_lower)
         # If mentions die/xóa → delete_die_all (already caught above, but safety)
         if re.search(r'die.*xóa|xóa.*die|die.*thì.*xóa', text_lower):
             return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🗑️ Đang check & xóa die TOÀN BỘ ({concurrency} luồng)..."}
