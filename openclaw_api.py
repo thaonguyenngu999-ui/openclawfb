@@ -91,11 +91,18 @@ class APIHandler(BaseHTTPRequestHandler):
         path = parsed.path
 
         # Endpoints that manage their own concurrency
-        no_lock_paths = {'/list_profiles', '/wait', '/send_telegram_photo',
+        no_lock_paths = {'/list_profiles', '/list_folders', '/wait', '/send_telegram_photo',
                          '/check_fb_batch', '/check_fb_status',
                          '/fb_nurture_batch', '/vision_skills', '/vision_clear_skills',
                          '/agent_execute', '/agent_skills', '/agent_task_history',
-                         '/agent_skill_delete'}
+                         '/agent_skill_delete', '/delete_profiles',
+                         '/list_tags', '/list_scripts', '/list_campaigns',
+                         '/get_profile_detail', '/get_versions', '/get_running',
+                         '/get_default_configs', '/get_schedules', '/get_user_info',
+                         '/create_profile', '/update_profile_name', '/update_profile_note',
+                         '/update_proxy', '/remove_proxy', '/change_fingerprint',
+                         '/change_status', '/add_to_folder', '/sync_tags',
+                         '/create_schedule'}
 
         try:
             if path in no_lock_paths:
@@ -155,6 +162,29 @@ class APIHandler(BaseHTTPRequestHandler):
 
         elif path == '/close':
             return self.fb_api.close_browser(params.get('profile'))
+
+        elif path == '/delete_profiles':
+            uuids = params.get('uuids') or params.get('profile_uuids', [])
+            if not uuids:
+                return {"error": "uuids required (list of profile UUIDs)"}
+            if isinstance(uuids, str):
+                uuids = [uuids]
+            # Resolve names → UUIDs
+            resolved = []
+            for u in uuids:
+                r = self.fb_api.resolve_profile(u)
+                if r:
+                    resolved.append(r)
+            if not resolved:
+                return {"error": "No valid profiles to delete"}
+            # Delete from Hidemium
+            from api_service import api as hidemium
+            result = hidemium.delete_profiles(resolved, is_local=True)
+            # Also delete from local DB
+            import db as _db
+            for uuid in resolved:
+                _db.delete_profile(uuid)
+            return {"success": True, "deleted": len(resolved), "uuids": resolved, "hidemium_result": result}
 
         elif path == '/check_login':
             return self.fb_api.check_login(params.get('profile'))
@@ -316,6 +346,14 @@ class APIHandler(BaseHTTPRequestHandler):
             profile_uuid = params.get('profile_uuid') or params.get('profile')
             return self.fb_api.debug_groups(profile_uuid)
 
+        elif path == '/list_folders':
+            try:
+                from api_service import api as hidemium
+                folders = hidemium.get_folders(limit=100)
+                return {"folders": folders, "total": len(folders)}
+            except Exception as e:
+                return {"error": str(e)}
+
         elif path == '/list_profiles':
             folder_id = params.get('folder_id')
             page = params.get('page', 1)
@@ -463,6 +501,196 @@ class APIHandler(BaseHTTPRequestHandler):
                 return {"error": "skill_id required"}
             ok = _db.delete_agent_skill(int(skill_id))
             return {"success": ok}
+
+        # ===== HIDEMIUM MANAGEMENT APIs =====
+        elif path == '/list_tags':
+            try:
+                from api_service import api as hidemium
+                result = hidemium.get_tags()
+                return {"tags": result}
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/list_scripts':
+            try:
+                from api_service import api as hidemium
+                scripts = hidemium.get_scripts(limit=100)
+                return {"scripts": scripts, "total": len(scripts)}
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/list_campaigns':
+            try:
+                from api_service import api as hidemium
+                search = params.get('search', '')
+                limit = int(params.get('limit', 50))
+                result = hidemium.get_campaigns(search=search, limit=limit)
+                return result
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/get_profile_detail':
+            try:
+                from api_service import api as hidemium
+                uuid = params.get('uuid') or params.get('profile_uuid')
+                if not uuid:
+                    return {"error": "uuid required"}
+                return hidemium.get_profile_detail(uuid)
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/create_profile':
+            try:
+                from api_service import api as hidemium
+                return hidemium.create_profile(params)
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/update_profile_name':
+            try:
+                from api_service import api as hidemium
+                uuid = params.get('uuid') or params.get('profile_uuid')
+                name = params.get('name')
+                if not uuid or not name:
+                    return {"error": "uuid and name required"}
+                return hidemium.update_profile_name(uuid, name)
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/update_profile_note':
+            try:
+                from api_service import api as hidemium
+                uuid = params.get('uuid') or params.get('profile_uuid')
+                note = params.get('note', '')
+                if not uuid:
+                    return {"error": "uuid required"}
+                return hidemium.update_profile_note(uuid, note)
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/update_proxy':
+            try:
+                from api_service import api as hidemium
+                uuid = params.get('uuid') or params.get('profile_uuid')
+                proxy_type = params.get('type', 'http')
+                ip = params.get('ip') or params.get('host')
+                port = params.get('port')
+                user = params.get('user', '')
+                password = params.get('pass', params.get('password', ''))
+                if not uuid or not ip or not port:
+                    return {"error": "uuid, ip, port required"}
+                return hidemium.update_proxy(uuid, proxy_type, ip, str(port), user, password)
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/remove_proxy':
+            try:
+                from api_service import api as hidemium
+                uuid = params.get('uuid') or params.get('profile_uuid')
+                if not uuid:
+                    return {"error": "uuid required"}
+                return hidemium.remove_proxy(uuid)
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/change_fingerprint':
+            try:
+                from api_service import api as hidemium
+                uuid = params.get('uuid') or params.get('profile_uuid')
+                if not uuid:
+                    return {"error": "uuid required"}
+                return hidemium.change_fingerprint(uuid)
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/change_status':
+            try:
+                from api_service import api as hidemium
+                uuid = params.get('uuid') or params.get('profile_uuid')
+                status = params.get('status')
+                if not uuid or not status:
+                    return {"error": "uuid and status required"}
+                return hidemium.change_status(uuid, status)
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/add_to_folder':
+            try:
+                from api_service import api as hidemium
+                folder_uuid = params.get('folder_uuid') or params.get('folder_id')
+                profile_uuids = params.get('profile_uuids', [])
+                if not folder_uuid or not profile_uuids:
+                    return {"error": "folder_uuid and profile_uuids required"}
+                return hidemium.add_profiles_to_folder(str(folder_uuid), profile_uuids)
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/sync_tags':
+            try:
+                from api_service import api as hidemium
+                uuid = params.get('uuid') or params.get('profile_uuid')
+                tags = params.get('tags', [])
+                if not uuid:
+                    return {"error": "uuid required"}
+                return hidemium.sync_tags(uuid, tags)
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/get_versions':
+            try:
+                from api_service import api as hidemium
+                versions = hidemium.get_versions()
+                return {"versions": versions, "total": len(versions)}
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/get_running':
+            try:
+                from api_service import api as hidemium
+                running = hidemium.get_running_profiles()
+                return {"running": running, "total": len(running)}
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/get_default_configs':
+            try:
+                from api_service import api as hidemium
+                return hidemium.get_default_configs()
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/create_schedule':
+            try:
+                from api_service import api as hidemium
+                name = params.get('name')
+                campaign_id = params.get('campaign_id')
+                start_time = params.get('start_time')
+                if not name or not campaign_id or not start_time:
+                    return {"error": "name, campaign_id, start_time required"}
+                return hidemium.create_schedule(
+                    name=name, campaign_id=int(campaign_id), start_time=start_time,
+                    execution_frequency=int(params.get('execution_frequency', 1)),
+                    is_running=params.get('is_running', False)
+                )
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/get_schedules':
+            try:
+                from api_service import api as hidemium
+                campaign_id = params.get('campaign_id')
+                if not campaign_id:
+                    return {"error": "campaign_id required"}
+                return hidemium.get_schedules(int(campaign_id))
+            except Exception as e:
+                return {"error": str(e)}
+
+        elif path == '/get_user_info':
+            try:
+                from api_service import api as hidemium
+                return hidemium.get_user_uuid()
+            except Exception as e:
+                return {"error": str(e)}
 
         else:
             return {"error": "Unknown endpoint"}

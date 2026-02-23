@@ -411,6 +411,80 @@ class HidemiumAPI:
     
     # ============ STATUS ============
     
+    def change_status(self, uuid: str, status: str) -> Dict:
+        """Đổi status profile (live, die, check, new...)"""
+        return self._request(
+            "PUT",
+            "/v1/browser/status/update",
+            data={"uuid": uuid, "status": status}
+        )
+    
+    def change_fingerprint(self, uuid: str) -> Dict:
+        """Tạo lại fingerprint cho profile"""
+        return self._request(
+            "PUT",
+            "/v1/browser/fingerprint",
+            data={"uuid": uuid}
+        )
+    
+    def update_profile_proxy_batch(self, uuids: List[str], proxy_type: str, 
+                                    ip: str, port: str, user: str = "", 
+                                    password: str = "") -> Dict:
+        """Cập nhật proxy cho nhiều profiles cùng lúc"""
+        return self._request(
+            "POST",
+            "/v1/browser/update-proxy",
+            data={
+                "uuid_browser": uuids,
+                "type": proxy_type,
+                "ip": ip,
+                "port": port,
+                "user": user,
+                "pass": password
+            }
+        )
+
+    def get_versions(self) -> List:
+        """Lấy danh sách phiên bản browser có sẵn"""
+        result = self._request("GET", "/v1/version/list")
+        if result and 'data' in result:
+            data = result['data']
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict) and 'content' in data:
+                return data['content'] if isinstance(data['content'], list) else [data['content']]
+        return []
+    
+    def get_user_uuid(self) -> Dict:
+        """Lấy UUID user hiện tại (license info)"""
+        return self._request("GET", "/v1/user/uuid")
+    
+    def create_schedule(self, name: str, campaign_id: int, start_time: str,
+                        execution_frequency: int = 1, task_type: int = 2,
+                        is_running: bool = False, **kwargs) -> Dict:
+        """Tạo lịch chạy campaign
+        execution_frequency: 1=Once, 2=Interval, 3=Daily, 4=Weekly, 5=Monthly
+        task_type: 2=Fixed
+        """
+        data = {
+            "name": name,
+            "campaign_id": campaign_id,
+            "execution_frequency": execution_frequency,
+            "start_time": start_time,
+            "task_type": task_type,
+            "isRunning": is_running
+        }
+        data.update(kwargs)
+        return self._request("POST", "/automation/schedule", data=data)
+    
+    def get_schedules(self, campaign_id: int, page: int = 1, limit: int = 10) -> Dict:
+        """Lấy lịch chạy của campaign"""
+        return self._request(
+            "GET",
+            "/automation/schedule",
+            params={"campaign_id": campaign_id, "page": page, "limit": limit}
+        )
+
     def get_status_list(self, is_local: bool = True) -> Dict:
         """Lấy danh sách status có thể có"""
         return self._request(

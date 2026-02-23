@@ -85,10 +85,26 @@ Available actions:
 14. fb_nurture_batch - Batch nurture: read feed + auto-comment on multiple profiles
 15. login_fb - Login Facebook with uid/password
 16. vision_capture - Capture browser screenshot for AI vision analysis
-17. vision_click - AI vision: find and click an element by description (e.g. "nút Tạo bài viết")
-18. vision_type - AI vision: find an input and type text (e.g. target="search box", text="hello")
-19. agent_execute - Autonomous AI agent: for ANY task not covered above. Agent will screenshot, analyze DOM, plan steps, and execute automatically. Use this for complex/unknown tasks.
+17. vision_click - AI vision: find and click an element by description
+18. vision_type - AI vision: find an input and type text
+19. agent_execute - Autonomous AI agent: for ANY task not covered above
 20. chat - Just chat, no action needed
+21. list_folders - List all Hidemium folders (thư mục)
+22. list_tags - List all tags
+23. list_scripts - List automation scripts
+24. list_campaigns - List campaigns
+25. get_running - List currently running profiles
+26. get_versions - List available browser versions
+27. create_profile - Create a new browser profile
+28. update_profile_name - Rename a profile (needs uuid, name)
+29. update_profile_note - Update profile note (needs uuid, note)
+30. update_proxy - Set proxy for profile (needs uuid, ip, port, type)
+31. remove_proxy - Remove proxy from profile (needs uuid)
+32. change_fingerprint - Regenerate fingerprint (needs uuid)
+33. change_status - Change profile status: live/die/check/new (needs uuid, status)
+34. add_to_folder - Add profiles to folder (needs folder_uuid, profile_uuids)
+35. sync_tags - Set tags for profile (needs uuid, tags[])
+36. delete_die_profiles - Delete all DIE profiles in a folder
 
 Profile naming convention:
 - "S10", "s10", "S 10" → profile = "S10"
@@ -104,11 +120,16 @@ Examples:
 {"action": "check_login", "params": {"profile": "S10"}, "reply": "Đang kiểm tra login S10..."}
 {"action": "check_fb_status", "params": {"profile": "S10"}, "reply": "Đang check trạng thái FB S10..."}
 {"action": "list_profiles", "params": {"folder_id": "fb1"}, "reply": "Đang lấy danh sách profiles fb1..."}
+{"action": "list_folders", "params": {}, "reply": "Đang lấy danh sách thư mục..."}
+{"action": "list_tags", "params": {}, "reply": "Đang lấy danh sách tags..."}
+{"action": "list_scripts", "params": {}, "reply": "Đang lấy danh sách scripts..."}
+{"action": "list_campaigns", "params": {}, "reply": "Đang lấy danh sách campaigns..."}
+{"action": "get_running", "params": {}, "reply": "Đang xem profiles đang chạy..."}
+{"action": "get_versions", "params": {}, "reply": "Đang xem phiên bản browser..."}
 {"action": "debug_groups", "params": {"profile": "S10"}, "reply": "Đang kiểm tra groups S10..."}
 {"action": "close_browser", "params": {"profile": "S10"}, "reply": "Đang đóng browser S10..."}
 {"action": "screenshot", "params": {"profile": "S10"}, "reply": "Đang chụp S10..."}
 {"action": "watch_reels", "params": {"profile": "S15", "count": 5, "comment": true, "comment_count": 3}, "reply": "Đang xem reels S15 và comment ngẫu nhiên..."}
-{"action": "watch_reels", "params": {"profile": "S10", "count": 10, "comment": false}, "reply": "Đang xem 10 reels S10..."}
 {"action": "batch_check_login", "params": {"folder_id": "fb2", "concurrency": 10}, "reply": "Đang check login fb2 (10 luồng)..."}
 {"action": "fb_read_feed", "params": {"profile": "S10", "scroll_count": 3}, "reply": "Đang đọc feed S10..."}
 {"action": "fb_comment", "params": {"profile": "S10", "post_index": 0, "comment": "Hay quá!"}, "reply": "Đang comment bài đầu tiên..."}
@@ -119,6 +140,9 @@ Examples:
 {"action": "vision_click", "params": {"profile": "S10", "target": "nút Tạo bài viết"}, "reply": "Đang tìm và click 'nút Tạo bài viết'..."}
 {"action": "vision_type", "params": {"profile": "S10", "target": "ô tìm kiếm", "text": "hello"}, "reply": "Đang gõ vào ô tìm kiếm..."}
 {"action": "agent_execute", "params": {"profile": "S10", "task": "xem thông báo, click ngẫu nhiên 1 thông báo"}, "reply": "🤖 Agent đang thực hiện..."}
+{"action": "change_fingerprint", "params": {"uuid": "xxx"}, "reply": "Đang đổi fingerprint..."}
+{"action": "change_status", "params": {"uuid": "xxx", "status": "live"}, "reply": "Đang đổi status..."}
+{"action": "delete_die_profiles", "params": {"folder_id": "fb1"}, "reply": "Đang xóa die fb1..."}
 {"action": "chat", "params": {}, "reply": "Chào bác!"}
 
 MULTIPLE ACTIONS IN ONE MESSAGE:
@@ -288,6 +312,197 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
         if "error" in result:
             return f"❌ Đóng browser {profile} thất bại: {result['error']}"
         return f"✅ Đã đóng browser `{profile}`"
+
+    if act == "list_folders":
+        result = await call_fb_api("/list_folders", data={})
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        folders = result.get("folders", [])
+        if not folders:
+            return "📁 Không có thư mục nào."
+        text = f"📁 **Thư mục ({len(folders)})**\n\n"
+        for f in folders:
+            name = f.get("name", "?")
+            fid = f.get("id", "?")
+            count = f.get("browser_count", f.get("total", "?"))
+            text += f"• **{name}** (id={fid}) — {count} profiles\n"
+        return text
+
+    if act == "list_tags":
+        result = await call_fb_api("/list_tags", data={})
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        tags = result.get("tags", {})
+        # tags could be dict or list
+        if isinstance(tags, dict):
+            items = tags.get("data", tags.get("content", []))
+        else:
+            items = tags
+        if not items:
+            return "🏷️ Không có tag nào."
+        if isinstance(items, list):
+            text = f"🏷️ **Tags ({len(items)})**\n\n"
+            for t in items[:30]:
+                if isinstance(t, dict):
+                    text += f"• `{t.get('name', t.get('tag', '?'))}`\n"
+                else:
+                    text += f"• `{t}`\n"
+            return text
+        return f"🏷️ Tags: {items}"
+
+    if act == "list_scripts":
+        result = await call_fb_api("/list_scripts", data={})
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        scripts = result.get("scripts", [])
+        if not scripts:
+            return "📜 Không có script nào."
+        text = f"📜 **Scripts ({len(scripts)})**\n\n"
+        for s in scripts[:20]:
+            name = s.get("name", "?")
+            sid = s.get("id", s.get("key", "?"))
+            text += f"• **{name}** (id={sid})\n"
+        if len(scripts) > 20:
+            text += f"... +{len(scripts)-20} scripts khác"
+        return text
+
+    if act == "list_campaigns":
+        result = await call_fb_api("/list_campaigns", data={})
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        campaigns = result.get("data", result.get("campaigns", []))
+        if isinstance(campaigns, dict):
+            campaigns = campaigns.get("content", [])
+        if not campaigns:
+            return "📋 Không có campaign nào."
+        text = f"📋 **Campaigns ({len(campaigns)})**\n\n"
+        for c in campaigns[:20]:
+            name = c.get("name", "?")
+            cid = c.get("id", "?")
+            text += f"• **{name}** (id={cid})\n"
+        return text
+
+    if act == "get_running":
+        result = await call_fb_api("/get_running", data={})
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        running = result.get("running", [])
+        total = result.get("total", len(running))
+        if not running:
+            return "🟢 Không có profile nào đang chạy."
+        text = f"🟢 **Đang chạy ({total} profiles)**\n\n"
+        for uuid in running[:20]:
+            text += f"• `{uuid[:12]}...`\n"
+        if len(running) > 20:
+            text += f"... +{len(running)-20} profiles khác"
+        return text
+
+    if act == "get_versions":
+        result = await call_fb_api("/get_versions", data={})
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        versions = result.get("versions", [])
+        if not versions:
+            return "🌐 Không có phiên bản nào."
+        text = f"🌐 **Browser versions ({len(versions)})**\n\n"
+        for v in versions[:15]:
+            if isinstance(v, dict):
+                text += f"• `{v.get('version', v.get('name', '?'))}`\n"
+            else:
+                text += f"• `{v}`\n"
+        return text
+
+    if act == "create_profile":
+        result = await call_fb_api("/create_profile", data=params)
+        if "error" in result:
+            return f"❌ Tạo profile thất bại: {result['error']}"
+        name = params.get("name", "New")
+        return f"✅ Đã tạo profile **{name}**"
+
+    if act == "update_profile_name":
+        uuid = params.get("uuid") or params.get("profile_uuid")
+        name = params.get("name")
+        if not uuid or not name:
+            return "❌ Cần uuid và name"
+        result = await call_fb_api("/update_profile_name", data={"uuid": uuid, "name": name})
+        if "error" in result:
+            return f"❌ Đổi tên thất bại: {result['error']}"
+        return f"✅ Đã đổi tên → **{name}**"
+
+    if act == "update_profile_note":
+        uuid = params.get("uuid") or params.get("profile_uuid")
+        note = params.get("note", "")
+        if not uuid:
+            return "❌ Cần uuid"
+        result = await call_fb_api("/update_profile_note", data={"uuid": uuid, "note": note})
+        if "error" in result:
+            return f"❌ Cập nhật note thất bại: {result['error']}"
+        return f"✅ Đã cập nhật note"
+
+    if act == "update_proxy":
+        uuid = params.get("uuid") or params.get("profile_uuid")
+        ip = params.get("ip") or params.get("host")
+        port = params.get("port")
+        if not uuid or not ip or not port:
+            return "❌ Cần uuid, ip, port"
+        result = await call_fb_api("/update_proxy", data={
+            "uuid": uuid, "type": params.get("type", "http"),
+            "ip": ip, "port": str(port),
+            "user": params.get("user", ""), "pass": params.get("pass", "")
+        })
+        if "error" in result:
+            return f"❌ Cập nhật proxy thất bại: {result['error']}"
+        return f"✅ Đã cập nhật proxy → {ip}:{port}"
+
+    if act == "remove_proxy":
+        uuid = params.get("uuid") or params.get("profile_uuid")
+        if not uuid:
+            return "❌ Cần uuid"
+        result = await call_fb_api("/remove_proxy", data={"uuid": uuid})
+        if "error" in result:
+            return f"❌ Xóa proxy thất bại: {result['error']}"
+        return "✅ Đã xóa proxy"
+
+    if act == "change_fingerprint":
+        uuid = params.get("uuid") or params.get("profile_uuid")
+        if not uuid:
+            return "❌ Cần uuid"
+        result = await call_fb_api("/change_fingerprint", data={"uuid": uuid})
+        if "error" in result:
+            return f"❌ Đổi fingerprint thất bại: {result['error']}"
+        return "✅ Đã tạo lại fingerprint"
+
+    if act == "change_status":
+        uuid = params.get("uuid") or params.get("profile_uuid")
+        status = params.get("status")
+        if not uuid or not status:
+            return "❌ Cần uuid và status"
+        result = await call_fb_api("/change_status", data={"uuid": uuid, "status": status})
+        if "error" in result:
+            return f"❌ Đổi status thất bại: {result['error']}"
+        return f"✅ Đã đổi status → **{status}**"
+
+    if act == "add_to_folder":
+        folder_uuid = params.get("folder_uuid") or params.get("folder_id")
+        profile_uuids = params.get("profile_uuids", [])
+        if not folder_uuid or not profile_uuids:
+            return "❌ Cần folder_uuid và profile_uuids"
+        result = await call_fb_api("/add_to_folder", data={
+            "folder_uuid": folder_uuid, "profile_uuids": profile_uuids
+        })
+        if "error" in result:
+            return f"❌ Thêm vào folder thất bại: {result['error']}"
+        return f"✅ Đã thêm {len(profile_uuids)} profiles vào folder"
+
+    if act == "sync_tags":
+        uuid = params.get("uuid") or params.get("profile_uuid")
+        tags = params.get("tags", [])
+        if not uuid:
+            return "❌ Cần uuid"
+        result = await call_fb_api("/sync_tags", data={"uuid": uuid, "tags": tags})
+        if "error" in result:
+            return f"❌ Sync tags thất bại: {result['error']}"
+        return f"✅ Đã sync tags: {', '.join(tags) if tags else '(xóa hết)'}"
 
     if act == "list_profiles":
         folder_id = params.get("folder_id")
@@ -516,6 +731,102 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
                 text += f"• `{e}`\n"
         return text
 
+    # ===== DELETE DIE PROFILES =====
+    if act == "delete_die_profiles":
+        folder_id = params.get("folder_id")
+        if not folder_id:
+            return "❌ Thiếu folder. VD: 'xóa die fb1'"
+        concurrency = params.get("concurrency", 5)
+
+        # Step 1: Get profiles
+        list_result = await call_fb_api("/list_profiles", data={"folder_id": folder_id, "page_size": 300})
+        if "error" in list_result:
+            return f"❌ Lỗi: {list_result['error']}"
+        profiles_list = list_result.get("data", [])
+        if isinstance(profiles_list, dict):
+            profiles_list = profiles_list.get("content", [])
+        if not profiles_list:
+            return f"📱 Không tìm thấy profiles nào trong {folder_id}."
+
+        total = len(profiles_list)
+        profile_names = [p.get("name", "") for p in profiles_list if p.get("name")]
+
+        # Step 2: Check login status
+        if telegram_chat_id and telegram_message_id:
+            try:
+                async with aiohttp.ClientSession() as s:
+                    await s.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
+                        json={"chat_id": telegram_chat_id, "message_id": telegram_message_id,
+                              "text": f"🔍 Đang check {total} profiles trong {folder_id}...\nSau đó sẽ xóa profiles DIE"}
+                    )
+            except Exception:
+                pass
+
+        batch_result = await call_fb_api("/check_fb_batch", data={
+            "profiles": profile_names,
+            "max_workers": concurrency,
+            "close_after": True,
+            "telegram_chat_id": telegram_chat_id,
+            "telegram_message_id": telegram_message_id,
+            "telegram_token": TELEGRAM_BOT_TOKEN
+        })
+
+        if "error" in batch_result:
+            return f"❌ Lỗi check: {batch_result['error']}"
+
+        results = batch_result.get("results", [])
+
+        # Collect die profiles
+        die_uuids = []
+        die_names = []
+        live_count = 0
+        locked_count = 0
+        for r in results:
+            status = r.get("status", "")
+            name = r.get("name", r.get("profile_uuid", "?")[:20])
+            uuid = r.get("profile_uuid", "")
+            if status in ("DIE", "NOT_LOGGED_IN"):
+                die_uuids.append(uuid)
+                die_names.append(name)
+            elif status == "LIVE":
+                live_count += 1
+            elif status in ("LOCKED", "2FA"):
+                locked_count += 1
+
+        if not die_uuids:
+            return (f"📊 {folder_id}: {total} profiles\n"
+                    f"✅ Live: {live_count} | 🔒 Lock: {locked_count}\n"
+                    f"Không có profile DIE nào để xóa!")
+
+        # Step 3: Delete die profiles
+        if telegram_chat_id and telegram_message_id:
+            try:
+                async with aiohttp.ClientSession() as s:
+                    await s.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
+                        json={"chat_id": telegram_chat_id, "message_id": telegram_message_id,
+                              "text": f"🗑️ Đang xóa {len(die_uuids)} profiles DIE..."}
+                    )
+            except Exception:
+                pass
+
+        del_result = await call_fb_api("/delete_profiles", data={"uuids": die_uuids})
+        deleted = del_result.get("deleted", 0)
+
+        text = f"🗑️ **Xóa DIE - {folder_id}**\n\n"
+        text += f"📊 Tổng: {total} profiles\n"
+        text += f"✅ Live: {live_count}\n"
+        if locked_count:
+            text += f"🔒 Locked: {locked_count}\n"
+        text += f"❌ Die: {len(die_names)}\n\n"
+        text += f"🗑️ **Đã xóa {deleted} profiles:**\n"
+        for n in die_names[:20]:
+            text += f"• `{n}`\n"
+        if len(die_names) > 20:
+            text += f"... +{len(die_names)-20} khác\n"
+        return text
+
     # ===== FEED =====
     if act == "fb_read_feed":
         if not profile:
@@ -710,7 +1021,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `s10 xem 5 reels` / `nuôi s10`\n"
         "• `đọc feed s10` / `chụp s10`\n"
         "• `vision click nút Like` trên s10\n"
-        "• `liệt kê profiles fb1`\n\n"
+        "• `liệt kê profiles fb1` / `thư mục`\n"
+        "• `tags` / `scripts` / `campaigns`\n"
+        "• `đang chạy` / `xóa die fb1`\n\n"
         "Gõ /help để xem đầy đủ.",
         parse_mode="Markdown"
     )
@@ -732,6 +1045,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "**📸 Screenshot & Vision:**\n"
         "`chụp s10` · `vision capture s10`\n"
         "`vision click nút Like trên s10`\n\n"
+        "**📁 Quản lý Hidemium:**\n"
+        "`thư mục` · `tags` · `scripts` · `campaigns`\n"
+        "`đang chạy` · `phiên bản browser`\n"
+        "`xóa die fb1` · `skills` · `lịch sử agent`\n\n"
         "**Lệnh nhanh:**\n"
         "/open\\_browser S10 · /leave\\_groups S10\n"
         "/debug\\_groups S10 · /profiles",
@@ -1011,6 +1328,40 @@ def try_quick_parse(text: str) -> dict | None:
     
     if profile and re.search(r'vision.*capture|chụp.*vision|phân tích.*dom|phân tích.*giao diện|analyze', text_lower):
         return {"action": "vision_capture", "params": {"profile": profile}, "reply": f"📸 Đang chụp vision {profile}..."}
+
+    # ===== DELETE DIE PROFILES =====
+    if re.search(r'xóa.*die|delete.*die|xóa.*chết|dọn.*die|xoá.*die', text_lower):
+        target_folder = folder_id
+        if not target_folder:
+            fm = re.search(r'fb\s*(\d+)', text_lower)
+            if fm:
+                target_folder = f"fb{fm.group(1)}"
+        if target_folder:
+            return {"action": "delete_die_profiles", "params": {"folder_id": target_folder}, "reply": f"🗑️ Đang check & xóa die trong {target_folder}..."}
+
+    # ===== LIST FOLDERS =====
+    if re.search(r'thư mục|folder|bao nhiêu.*fb|mấy.*fb|các fb|list.*folder|danh sách.*folder', text_lower) and not profile:
+        return {"action": "list_folders", "params": {}, "reply": "📁 Đang lấy danh sách thư mục..."}
+
+    # ===== LIST TAGS =====
+    if re.search(r'list.*tag|danh sách.*tag|xem.*tag|có.*tag|tags', text_lower) and not profile:
+        return {"action": "list_tags", "params": {}, "reply": "🏷️ Đang lấy danh sách tags..."}
+
+    # ===== LIST SCRIPTS =====
+    if re.search(r'list.*script|danh sách.*script|xem.*script|scripts|kịch bản', text_lower) and not profile:
+        return {"action": "list_scripts", "params": {}, "reply": "📜 Đang lấy danh sách scripts..."}
+
+    # ===== LIST CAMPAIGNS =====
+    if re.search(r'list.*campaign|danh sách.*campaign|xem.*campaign|campaigns|chiến dịch', text_lower) and not profile:
+        return {"action": "list_campaigns", "params": {}, "reply": "📋 Đang lấy danh sách campaigns..."}
+
+    # ===== GET RUNNING =====
+    if re.search(r'đang chạy|running|đang mở|profile.*mở|browser.*mở|bao nhiêu.*mở', text_lower) and not profile:
+        return {"action": "get_running", "params": {}, "reply": "🟢 Đang xem profiles đang chạy..."}
+
+    # ===== GET VERSIONS =====
+    if re.search(r'version|phiên bản|browser version', text_lower) and not profile:
+        return {"action": "get_versions", "params": {}, "reply": "🌐 Đang xem phiên bản browser..."}
 
     # ===== LIST PROFILES =====
     if re.search(r'liệt kê.*profile|list.*profile|profiles|danh sách.*profile', text_lower):
