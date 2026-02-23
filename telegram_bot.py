@@ -937,6 +937,65 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
         total_text += f"❌ Die: {grand_die} | 🗑️ Đã xóa: {grand_deleted}"
         return total_text
 
+    if act == "delete_all_profiles":
+        folder_id = params.get("folder_id")
+        if not folder_id:
+            return "❌ Thiếu folder. VD: 'xóa hết profile fb3'"
+
+        # Step 1: Get all profiles in folder
+        list_result = await call_fb_api("/list_profiles", data={"folder_id": folder_id, "page_size": 500})
+        if "error" in list_result:
+            return f"❌ Lỗi: {list_result['error']}"
+        profiles_list = list_result.get("data", [])
+        if isinstance(profiles_list, dict):
+            profiles_list = profiles_list.get("content", [])
+        if not profiles_list:
+            return f"📱 Không có profile nào trong {folder_id}."
+
+        total = len(profiles_list)
+        all_uuids = [p.get("uuid") or p.get("profile_uuid") for p in profiles_list if p.get("uuid") or p.get("profile_uuid")]
+        all_names = [p.get("name", "?") for p in profiles_list]
+
+        if not all_uuids:
+            return f"❌ Không lấy được UUID từ profiles trong {folder_id}."
+
+        # Step 2: Update progress
+        if telegram_chat_id and telegram_message_id:
+            try:
+                async with aiohttp.ClientSession() as s:
+                    await s.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
+                        json={"chat_id": telegram_chat_id, "message_id": telegram_message_id,
+                              "text": f"🗑️ Đang xóa TẤT CẢ {total} profiles trong {folder_id}..."}
+                    )
+            except Exception:
+                pass
+
+        # Step 3: Delete all (batch, 50 at a time to avoid API limits)
+        deleted_total = 0
+        errors = []
+        for i in range(0, len(all_uuids), 50):
+            batch = all_uuids[i:i+50]
+            try:
+                del_result = await call_fb_api("/delete_profiles", data={"uuids": batch})
+                if "error" in del_result:
+                    errors.append(f"Batch {i//50+1}: {del_result['error']}")
+                else:
+                    deleted_total += del_result.get("deleted", len(batch))
+            except Exception as e:
+                errors.append(f"Batch {i//50+1}: {e}")
+
+        text = f"🗑️ **Xóa TẤT CẢ profiles - {folder_id}**\n\n"
+        text += f"📊 Tổng: {total} profiles\n"
+        text += f"🗑️ **Đã xóa: {deleted_total}**\n"
+        if errors:
+            text += f"\n⚠️ Lỗi:\n"
+            for err in errors[:5]:
+                text += f"• {err}\n"
+        if deleted_total > 0:
+            text += f"\n✅ Xóa sạch {folder_id}!"
+        return text
+
     if act == "delete_die_profiles":
         folder_id = params.get("folder_id")
         if not folder_id:
@@ -1587,6 +1646,8 @@ CONCEPTS = {
                   "lần nữa", "nữa"],
     "RESULT":    ["kết quả", "rồi sao", "xong chưa", "sao rồi", "thế nào", "ok chưa",
                   "xong", "ra sao", "kết quả sao"],
+    "QUESTION":  ["chưa", "chưa?", "rồi chưa", "đã chưa", "xong chưa", "hết chưa",
+                  "chưa vậy", "chưa bác", "đâu rồi", "sao rồi", "được chưa"],
 }
 
 # Pre-compile concept patterns for speed
@@ -1612,6 +1673,19 @@ def _detect_concepts(text_lower: str) -> set:
 # Higher score wins. Required = must have ALL. Optional = bonus points.
 INTENT_RULES = {
     # --- Delete die (folder or all) ---
+    # --- Delete ALL profiles (total wipe, no check needed) ---
+    "delete_all_profiles": {
+        "formulas": [
+            # "xóa hết profile ở fb3" = REMOVE + ALL + PROFILE + FOLDER (no DIE)
+            ({"REMOVE", "ALL", "PROFILE"}, {"FOLDER"}, 15),
+            # "xóa hết fb3"
+            ({"REMOVE", "ALL"}, {"PROFILE", "FOLDER"}, 11),
+            # "xóa sạch fb3"
+            ({"REMOVE"}, {"ALL", "PROFILE"}, 8),
+        ],
+        "needs_folder": True,
+        "needs_no": {"DIE", "LIVE", "KEEP"},  # If mentions die/live → delete_die instead
+    },
     "delete_die_all": {
         "formulas": [
             # "check toàn bộ die xóa live giữ"
@@ -1804,8 +1878,17 @@ def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
     last_folder = ctx.get("folder")
     last_profile = ctx.get("profile")
     
+    # === QUESTION detection: "đã xóa hết chưa", "xong chưa", "xóa rồi chưa" ===
+    # If text contains QUESTION concept → treat as asking about result, not as an action
+    if "QUESTION" in concepts and len(text_lower) < 50:
+        # "đã xóa hết chưa" = asking about result, NOT requesting delete
+        last_result = ctx.get("last_result", "")
+        if last_result:
+            return {"action": "chat", "params": {}, "reply": f"Kết quả lần trước: {last_result[:300]}"}
+        return {"action": "chat", "params": {}, "reply": "Chưa có kết quả trước đó bác ơi. Bác muốn check gì?"}
+    
     # Pure follow-up: only CONFIRM/RETRY/RESULT concepts, nothing else substantive
-    action_concepts = concepts - {"CONFIRM", "RETRY", "RESULT", "ALL", "KEEP", "LIVE"}
+    action_concepts = concepts - {"CONFIRM", "RETRY", "RESULT", "QUESTION", "ALL", "KEEP", "LIVE"}
     
     if len(text_lower) < 40 and not action_concepts:
         # "ok", "làm đi", "tiếp", "chạy luôn"
@@ -1891,6 +1974,10 @@ def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
 def _build_action(intent: str, concepts: set, profile: str, folder_id: str,
                    concurrency: int, text_lower: str, raw: str) -> dict:
     """Build the action dict for the winning intent."""
+    
+    if intent == "delete_all_profiles":
+        return {"action": "delete_all_profiles", "params": {"folder_id": folder_id},
+                "reply": f"🗑️ Đang xóa TẤT CẢ profiles trong {folder_id}..."}
     
     if intent == "delete_die_all":
         return {"action": "delete_die_all", "params": {"concurrency": concurrency},
