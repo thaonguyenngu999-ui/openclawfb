@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 FB Manager Pro Telegram Bot — NLP-powered.
-Primary: Pollinations.ai gemini-fast (Google Gemini 2.5 Flash Lite, ultra-cheap)
+Primary: Pollinations.ai openai (OpenAI GPT-5 Mini, smart & affordable)
 Fallback: JanAI Devstral-24B (local, FREE)
 Understands natural language like "s10 thoát hết nhóm" and executes FB Manager actions.
 """
@@ -26,11 +26,11 @@ sys.stdout.reconfigure(encoding='utf-8')
 TELEGRAM_BOT_TOKEN = "6891995669:AAHOlqrRiSoNzI1FcyqWemvpo5ZRxV4AKDI"
 FB_MANAGER_API = "http://127.0.0.1:8899"
 
-# Pollinations.ai (primary) — gemini-fast = Google Gemini 2.5 Flash Lite
-# 3,200 responses/pollen, 0.01/M input, 0.4/M output — ultra cheap
+# Pollinations.ai (primary) — openai = OpenAI GPT-5 Mini
+# 700 responses/pollen, 0.15/M input, 0.6/M output — smart & affordable
 POLLINATIONS_API = "https://gen.pollinations.ai/v1"
 POLLINATIONS_KEY = "sk_3HRi9HUGLup7OKB6ykRds8YtnpcmLHD3"
-POLLINATIONS_MODEL = "gemini-fast"  # Google Gemini 2.5 Flash Lite
+POLLINATIONS_MODEL = "openai"  # OpenAI GPT-5 Mini
 
 # JanAI local (fallback) — Devstral-24B, FREE, no internet needed
 JANAI_API = "http://127.0.0.1:1337/v1"
@@ -170,7 +170,7 @@ IMPORTANT:
 # AI providers (Pollinations primary, JanAI fallback)
 # ============================================================
 async def call_pollinations(messages: list, max_tokens: int = 300, temperature: float = 0.1) -> str:
-    """Call Pollinations.ai (gemini-fast = Gemini 2.5 Flash Lite). Ultra cheap."""
+    """Call Pollinations.ai (openai = OpenAI GPT-5 Mini). Smart & affordable."""
     try:
         async with aiohttp.ClientSession() as session:
             payload = {
@@ -1545,7 +1545,7 @@ def main():
     # NLP text handler (catches everything else)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     
-    logger.info("🚀 Bot started (Pollinations gemini-fast + JanAI fallback + FB Manager Pro)")
+    logger.info("🚀 Bot started (Pollinations GPT-5 Mini + JanAI fallback + FB Manager Pro)")
     app.run_polling(drop_pending_updates=True)
 
 
