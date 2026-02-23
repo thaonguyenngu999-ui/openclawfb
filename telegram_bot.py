@@ -351,20 +351,36 @@ async def call_ai(messages: list, max_tokens: int = 300, temperature: float = 0.
     return await call_janai(messages, max_tokens, temperature)
 
 
-async def call_fb_api(endpoint: str, method: str = "POST", data: dict = None) -> dict:
-    """Call FB Manager Pro API."""
-    try:
-        async with aiohttp.ClientSession() as session:
-            url = f"{FB_MANAGER_API}{endpoint}"
-            if method == "POST":
-                async with session.post(url, json=data or {}, timeout=aiohttp.ClientTimeout(total=300)) as resp:
-                    return await resp.json()
-            else:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                    return await resp.json()
-    except Exception as e:
-        logger.error(f"FB API error: {e}")
-        return {"error": str(e)}
+async def call_fb_api(endpoint: str, method: str = "POST", data: dict = None, max_retries: int = 3) -> dict:
+    """Call FB Manager Pro API with auto-retry on connection errors."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{FB_MANAGER_API}{endpoint}"
+                if method == "POST":
+                    async with session.post(url, json=data or {}, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+                        return await resp.json()
+                else:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                        return await resp.json()
+        except (aiohttp.ClientConnectorError, aiohttp.ClientOSError, ConnectionRefusedError) as e:
+            last_error = e
+            wait = (attempt + 1) * 2  # 2s, 4s, 6s
+            logger.warning(f"API connection failed (attempt {attempt+1}/{max_retries}): {e}. Retry in {wait}s...")
+            await asyncio.sleep(wait)
+        except asyncio.TimeoutError:
+            last_error = "Timeout (300s)"
+            logger.warning(f"API timeout (attempt {attempt+1}/{max_retries}): {endpoint}")
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.error(f"FB API error: {e}")
+            return {"error": str(e)}
+    # All retries failed
+    error_msg = str(last_error)
+    if "Connect" in error_msg or "refused" in error_msg.lower():
+        return {"error": f"API server không phản hồi sau {max_retries} lần thử. Kiểm tra openclaw_api.py hoặc Hidemium có đang chạy không."}
+    return {"error": f"Lỗi sau {max_retries} lần retry: {error_msg}"}
 
 
 def parse_ai_response(text: str) -> dict | list:
@@ -1641,7 +1657,7 @@ async def _message_handler_inner(update: Update, context: ContextTypes.DEFAULT_T
     # Save original user message to history (without hints)
     add_to_history(chat_id, "user", user_msg)
     
-    ai_response = await call_ai(messages, max_tokens=800, temperature=0.4)
+    ai_response = await call_ai(messages, max_tokens=800, temperature=0.3)
     logger.info(f"AI raw: {ai_response[:300]}")
     
     parsed = parse_ai_response(ai_response)
@@ -1649,7 +1665,7 @@ async def _message_handler_inner(update: Update, context: ContextTypes.DEFAULT_T
     # === JSON RETRY: If AI returned plain text (chat fallback) but user wanted an action ===
     if isinstance(parsed, dict) and parsed.get("action") == "chat":
         # Check if the original message seems like an action request
-        action_keywords = r'check|xóa|mở|đóng|xem|list|kiểm|nuôi|lướt|agent|thoát|delete|scan|bật|chạy|open|close'
+        action_keywords = r'check|xóa|mở|đóng|xem|list|kiểm|nuôi|lướt|agent|thoát|delete|scan|bật|chạy|open|close|die|live|folder|fb\d|s\d'
         if re.search(action_keywords, user_msg.lower()):
             # AI returned chat but user wanted action → retry with stronger JSON instruction
             logger.warning("AI returned chat for action-like message, retrying with JSON nudge...")
@@ -1733,6 +1749,28 @@ async def _message_handler_inner(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         logger.warning(f"edit_text reply failed: {e}")
     result = await execute_action(action, telegram_chat_id=chat_id, telegram_message_id=msg.message_id)
+    
+    # ===== AI SELF-DIAGNOSE: If result has errors, let AI analyze and suggest fixes =====
+    if result and ('❌' in result or '⚠️ Lỗi' in result) and 'ConnectError' not in str(result):
+        # Error occurred — feed back to AI for smart error analysis
+        act_name = action.get('action', 'unknown')
+        logger.info(f"Error in {act_name}, letting AI analyze...")
+        diag_messages = [{"role": "system", "content": (
+            "Bạn là AI quản lý FB. Một action vừa thất bại. "
+            "Phân tích ngắn gọn: lỗi gì, nguyên nhân khả năng, cách khắc phục. "
+            "Trả lời bằng tiếng Việt, gọn, 2-3 câu. Không JSON."
+        )}]
+        diag_messages.append({"role": "user", "content": (
+            f"Action: {act_name}\nParams: {action.get('params', {})}\n"
+            f"Error: {result[:500]}\n\nPhân tích lỗi và gợi ý cách sửa."
+        )})
+        try:
+            diagnosis = await call_ai(diag_messages, max_tokens=200, temperature=0.3)
+            if diagnosis and len(diagnosis.strip()) > 10:
+                result += f"\n\n🧠 **AI phân tích:** {diagnosis.strip()}"
+        except Exception:
+            pass  # Don't let diagnosis failure break the flow
+    
     # Save structured result to history for smarter context tracking
     act_name = action.get('action', 'unknown')
     act_params = action.get('params', {})
