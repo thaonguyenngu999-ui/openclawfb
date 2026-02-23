@@ -456,9 +456,24 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
         for f in folders:
             name = f.get("name", "?")
             fid = f.get("id", "?")
-            count = f.get("total_browser", f.get("browser_count", f.get("total", 0)))
-            grand_total += count if isinstance(count, int) else 0
-            text += f"• **{name}** (id={fid}) — {count} profiles\n"
+            # Get REAL profile count by calling list_profiles (not cached total_browser)
+            real_count = 0
+            try:
+                lp = await call_fb_api("/list_profiles", data={"folder_id": str(fid), "page_size": 1})
+                if "total" in lp:
+                    real_count = lp["total"]
+                elif "data" in lp:
+                    d = lp["data"]
+                    if isinstance(d, dict):
+                        real_count = d.get("meta", {}).get("total", len(d.get("content", [])))
+                    elif isinstance(d, list):
+                        real_count = len(d)
+                else:
+                    real_count = f.get("total_browser", 0)
+            except Exception:
+                real_count = f.get("total_browser", 0)
+            grand_total += real_count if isinstance(real_count, int) else 0
+            text += f"• **{name}** (id={fid}) — {real_count} profiles\n"
         text += f"\n📊 Tổng: **{grand_total}** profiles"
         return text
 
@@ -640,7 +655,7 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
 
     if act == "list_profiles":
         folder_id = params.get("folder_id")
-        # If no folder specified → show summary per folder instead of dumping all profiles
+        # If no folder specified → show summary per folder with REAL counts
         if not folder_id:
             folders_result = await call_fb_api("/list_folders", data={})
             if "error" not in folders_result:
@@ -650,9 +665,25 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
                     text = "📊 **Tổng hợp profiles:**\n\n"
                     for f in folders:
                         name = f.get("name", "?")
-                        count = f.get("total_browser", f.get("browser_count", 0))
-                        grand_total += count if isinstance(count, int) else 0
-                        text += f"📁 **{name}**: {count} profiles\n"
+                        fid = f.get("id", "?")
+                        # Get REAL count
+                        real_count = 0
+                        try:
+                            lp = await call_fb_api("/list_profiles", data={"folder_id": str(fid), "page_size": 1})
+                            if "total" in lp:
+                                real_count = lp["total"]
+                            elif "data" in lp:
+                                d = lp["data"]
+                                if isinstance(d, dict):
+                                    real_count = d.get("meta", {}).get("total", len(d.get("content", [])))
+                                elif isinstance(d, list):
+                                    real_count = len(d)
+                            else:
+                                real_count = f.get("total_browser", 0)
+                        except Exception:
+                            real_count = f.get("total_browser", 0)
+                        grand_total += real_count if isinstance(real_count, int) else 0
+                        text += f"📁 **{name}**: {real_count} profiles\n"
                     text += f"\n📊 **Tổng: {grand_total} profiles**"
                     text += "\n\n💡 Gõ `fb1`, `fb3`... để xem chi tiết từng folder"
                     return text
