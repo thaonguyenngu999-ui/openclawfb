@@ -966,7 +966,19 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
                 if current_count == 0:
                     return f"✅ Đã xóa sạch {v_folder} rồi bác! Hiện tại còn 0 profiles."
                 elif current_count > 0:
-                    return f"⚠️ Chưa hết bác ơi, {v_folder} vẫn còn {current_count} profiles. Bác muốn xóa tiếp không?"
+                    auto_action = params.get("auto_action")
+                    if auto_action == "delete_all":
+                        # Auto-execute: delete ALL without asking
+                        sub = {"action": "delete_all_profiles", "params": {"folder_id": v_folder}}
+                        del_result = await execute_action(sub, telegram_chat_id=telegram_chat_id, telegram_message_id=telegram_message_id)
+                        return f"⚠️ {v_folder} còn {current_count} profiles → Xóa hết!\n\n{del_result}"
+                    elif auto_action == "delete_die":
+                        # Auto-execute: delete DIE only
+                        sub = {"action": "delete_die_profiles", "params": {"folder_id": v_folder, "concurrency": 10}}
+                        del_result = await execute_action(sub, telegram_chat_id=telegram_chat_id, telegram_message_id=telegram_message_id)
+                        return f"⚠️ {v_folder} còn {current_count} profiles → Xóa die!\n\n{del_result}"
+                    else:
+                        return f"⚠️ Chưa hết bác ơi, {v_folder} vẫn còn {current_count} profiles. Bác muốn xóa tiếp không?"
                 else:
                     return f"❌ Không kiểm tra được {v_folder}. Thử lại sau bac nhé."
             elif topic == "check":
@@ -1976,7 +1988,7 @@ def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
     
     # === QUESTION / RESULT detection ===
     # "đã xóa hết chưa", "xong chưa", "sao rồi" → VERIFY real state, not just copy old text
-    if ("QUESTION" in concepts or "RESULT" in concepts) and len(text_lower) < 60:
+    if ("QUESTION" in concepts or "RESULT" in concepts) and len(text_lower) < 100:
         # Detect WHAT the question is about from concepts + history
         question_topic = None
         if "REMOVE" in concepts or ctx.get("action") in ("xóa", "delete_die", "delete_all"):
@@ -1990,12 +2002,31 @@ def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
         verify_folder = folder_id or last_folder
         verify_profile = profile or last_profile
         
+        # Detect compound request: "xóa hết chưa? chưa thì xóa đi"
+        # Only auto-execute when there's a clear conditional pattern
+        auto_action = None
+        if "REMOVE" in concepts:
+            # Check for conditional patterns: "chưa thì xóa", "nếu chưa thì", "k thì xóa"
+            conditional = bool(re.search(r'chưa\s*thì|nếu\s*chưa|không\s*thì|chưa\s*(?:thì\s*)?xóa|k\s*thì', text_lower))
+            no_check = bool(re.search(r'k\s*cần\s*check|không\s*cần\s*check|không\s*check|k\s*check|khỏi\s*check', text_lower))
+            if conditional or no_check:
+                if "ALL" in concepts and "DIE" not in concepts:
+                    auto_action = "delete_all"
+                elif no_check:
+                    auto_action = "delete_all"  # "k cần check" = delete all, not just die
+                elif "DIE" in concepts:
+                    auto_action = "delete_die"
+                elif conditional:
+                    # "chưa thì xóa đi" without specifying die → delete all
+                    auto_action = "delete_all"
+        
         return {"action": "verify_status", "params": {
             "topic": question_topic,
             "folder_id": verify_folder,
             "profile": verify_profile,
             "original_question": text_lower,
             "last_result": ctx.get("last_result", ""),
+            "auto_action": auto_action,
         }, "reply": "🔍 Đang kiểm tra..."}
     
     # Pure follow-up: only CONFIRM/RETRY concepts, nothing else substantive
@@ -2005,8 +2036,14 @@ def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
         # "ok", "làm đi", "tiếp", "chạy luôn"
         if "CONFIRM" in concepts:
             if last_folder:
-                return {"action": "delete_die_profiles", "params": {"folder_id": last_folder, "concurrency": 10},
-                        "reply": f"✅ OK, đang thực hiện cho {last_folder}..."}
+                ctx_action = ctx.get("action")
+                # Respect the context: if last action was delete_all, confirm with delete_all
+                if ctx_action == "delete_all":
+                    return {"action": "delete_all_profiles", "params": {"folder_id": last_folder},
+                            "reply": f"✅ OK, đang xóa hết {last_folder}..."}
+                else:
+                    return {"action": "delete_die_profiles", "params": {"folder_id": last_folder, "concurrency": 10},
+                            "reply": f"✅ OK, đang xóa die {last_folder}..."}
             return None
         
         # "làm lại", "thử lại", "check lại"
