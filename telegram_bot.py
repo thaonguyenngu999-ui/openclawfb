@@ -26,10 +26,16 @@ sys.stdout.reconfigure(encoding='utf-8')
 TELEGRAM_BOT_TOKEN = "6891995669:AAHOlqrRiSoNzI1FcyqWemvpo5ZRxV4AKDI"
 FB_MANAGER_API = "http://127.0.0.1:8899"
 
-# Pollinations.ai — Model rotation pool (smart → fast → cheap)
-# When one model hits rate limit, auto-rotate to next
+# Pollinations.ai — Key rotation + Model fallback
+# Primary: rotate API keys on same best model
+# Fallback: try other models if all keys exhausted
 POLLINATIONS_API = "https://gen.pollinations.ai/v1"
-POLLINATIONS_KEY = "sk_3HRi9HUGLup7OKB6ykRds8YtnpcmLHD3"
+
+# API Key pool: ordered by pollen balance (most first)
+POLLINATIONS_KEYS = [
+    {"key": "sk_cH1x3TFuKuaFAK1tHH2y8NLJNejEgxJH", "name": "Key-3P", "pollen": 3},   # 3 pollen
+    {"key": "sk_3HRi9HUGLup7OKB6ykRds8YtnpcmLHD3",  "name": "Key-1P", "pollen": 1},   # 1 pollen
+]
 
 # Model pool: ordered by intelligence (best first)
 POLLINATIONS_MODELS = [
@@ -40,22 +46,43 @@ POLLINATIONS_MODELS = [
     {"model": "openai-fast", "name": "GPT-5 Nano",        "timeout": 25},   # Fast backup
 ]
 
-# Track current model index + cooldowns
+# Track rotation state + cooldowns
 import time as _time
-_model_index = 0  # Start with best model
-_model_cooldowns = {}  # model_name -> cooldown_until timestamp
+_key_index = 0       # Start with best key (3 pollen)
+_model_index = 0     # Start with best model
+_key_cooldowns = {}   # key -> cooldown_until timestamp
+_model_cooldowns = {} # model -> cooldown_until timestamp
+
+def _get_next_key() -> dict:
+    """Get next available API key, skip ones on cooldown."""
+    global _key_index
+    now = _time.time()
+    for _ in range(len(POLLINATIONS_KEYS)):
+        k = POLLINATIONS_KEYS[_key_index % len(POLLINATIONS_KEYS)]
+        if now >= _key_cooldowns.get(k["key"], 0):
+            return k
+        _key_index = (_key_index + 1) % len(POLLINATIONS_KEYS)
+    # All on cooldown — clear and return first
+    _key_cooldowns.clear()
+    return POLLINATIONS_KEYS[0]
+
+def _rotate_key(failed_key: str, cooldown_secs: int = 90):
+    """Put failed key on cooldown and rotate to next."""
+    global _key_index
+    _key_cooldowns[failed_key] = _time.time() + cooldown_secs
+    _key_index = (_key_index + 1) % len(POLLINATIONS_KEYS)
+    next_k = _get_next_key()
+    logger.warning(f"🔑 Key rotated → {next_k['name']} (cooldown {cooldown_secs}s)")
 
 def _get_next_model() -> dict:
-    """Get next available model, skipping ones on cooldown."""
+    """Get next available model, skip ones on cooldown."""
     global _model_index
     now = _time.time()
     for _ in range(len(POLLINATIONS_MODELS)):
         m = POLLINATIONS_MODELS[_model_index % len(POLLINATIONS_MODELS)]
-        cooldown_until = _model_cooldowns.get(m["model"], 0)
-        if now >= cooldown_until:
+        if now >= _model_cooldowns.get(m["model"], 0):
             return m
         _model_index = (_model_index + 1) % len(POLLINATIONS_MODELS)
-    # All on cooldown — return first one anyway (cooldown may have expired)
     _model_cooldowns.clear()
     return POLLINATIONS_MODELS[0]
 
@@ -65,8 +92,7 @@ def _rotate_model(failed_model: str, cooldown_secs: int = 60):
     _model_cooldowns[failed_model] = _time.time() + cooldown_secs
     _model_index = (_model_index + 1) % len(POLLINATIONS_MODELS)
     next_m = _get_next_model()
-    logger.warning(f"🔄 Rotated from {failed_model} → {next_m['name']} (cooldown {cooldown_secs}s)")
-    return next_m
+    logger.warning(f"🔄 Model rotated → {next_m['name']} (cooldown {cooldown_secs}s)")
 
 # JanAI local (last resort fallback) — Devstral-24B, FREE, no internet needed
 JANAI_API = "http://127.0.0.1:1337/v1"
@@ -203,33 +229,43 @@ IMPORTANT:
 
 
 # ============================================================
-# AI providers (Pollinations rotation + JanAI fallback)
+# AI providers (Key rotation → Model fallback → JanAI)
 # ============================================================
 async def call_pollinations(messages: list, max_tokens: int = 300, temperature: float = 0.1) -> str:
-    """Call Pollinations.ai with auto-rotation across 5 models.
-    On rate limit (429) or error, rotate to next model and retry."""
-    tried = set()
+    """Call Pollinations.ai with KEY rotation + MODEL fallback.
+    Strategy: Try all keys on best model → try all keys on next model → ... → JanAI.
+    """
+    tried_combos = set()  # (key, model) combos already tried
+    max_attempts = len(POLLINATIONS_KEYS) * len(POLLINATIONS_MODELS)
+    attempts = 0
     
-    while len(tried) < len(POLLINATIONS_MODELS):
+    while attempts < max_attempts:
+        key_info = _get_next_key()
         model_info = _get_next_model()
-        model_id = model_info["model"]
+        combo = (key_info["key"], model_info["model"])
         
-        if model_id in tried:
-            _rotate_model(model_id, cooldown_secs=30)
+        if combo in tried_combos:
+            # Try rotating key first, then model
+            if attempts % len(POLLINATIONS_KEYS) == 0 and attempts > 0:
+                _rotate_model(model_info["model"], cooldown_secs=30)
+            else:
+                _rotate_key(key_info["key"], cooldown_secs=30)
+            attempts += 1
             continue
-        tried.add(model_id)
+        tried_combos.add(combo)
+        attempts += 1
         
         try:
             async with aiohttp.ClientSession() as session:
                 payload = {
-                    "model": model_id,
+                    "model": model_info["model"],
                     "messages": messages,
                     "max_tokens": max_tokens,
                     "temperature": temperature,
                     "stream": False
                 }
                 headers = {
-                    "Authorization": f"Bearer {POLLINATIONS_KEY}",
+                    "Authorization": f"Bearer {key_info['key']}",
                     "Content-Type": "application/json"
                 }
                 timeout = aiohttp.ClientTimeout(total=model_info.get("timeout", 30))
@@ -242,28 +278,28 @@ async def call_pollinations(messages: list, max_tokens: int = 300, temperature: 
                     if resp.status == 200:
                         data = await resp.json()
                         content = data["choices"][0]["message"]["content"]
-                        logger.info(f"✅ Pollinations OK [{model_info['name']}]")
+                        logger.info(f"✅ AI OK [{model_info['name']}] [{key_info['name']}]")
                         return content
                     elif resp.status == 429:
-                        # Rate limited — rotate to next model
-                        logger.warning(f"⚠️ {model_info['name']} rate limited (429)")
-                        _rotate_model(model_id, cooldown_secs=120)
+                        # Rate limited on this key — rotate key first
+                        logger.warning(f"⚠️ 429 [{key_info['name']}] [{model_info['name']}]")
+                        _rotate_key(key_info["key"], cooldown_secs=120)
                         continue
                     else:
                         error_text = await resp.text()
-                        logger.warning(f"⚠️ {model_info['name']} error {resp.status}: {error_text[:150]}")
-                        _rotate_model(model_id, cooldown_secs=60)
+                        logger.warning(f"⚠️ {resp.status} [{key_info['name']}] [{model_info['name']}]: {error_text[:100]}")
+                        _rotate_key(key_info["key"], cooldown_secs=60)
                         continue
         except asyncio.TimeoutError:
-            logger.warning(f"⏰ {model_info['name']} timeout")
-            _rotate_model(model_id, cooldown_secs=60)
+            logger.warning(f"⏰ Timeout [{key_info['name']}] [{model_info['name']}]")
+            _rotate_model(model_info["model"], cooldown_secs=60)
             continue
         except Exception as e:
-            logger.warning(f"❌ {model_info['name']} error: {e}")
-            _rotate_model(model_id, cooldown_secs=60)
+            logger.warning(f"❌ Error [{key_info['name']}] [{model_info['name']}]: {e}")
+            _rotate_key(key_info["key"], cooldown_secs=60)
             continue
     
-    logger.error("All Pollinations models failed!")
+    logger.error("All Pollinations keys × models failed!")
     return None  # Signal to try JanAI fallback
 
 
