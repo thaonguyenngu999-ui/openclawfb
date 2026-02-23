@@ -1520,44 +1520,260 @@ def _extract_concurrency(text_lower: str, default: int = 5) -> int:
     return default
 
 
+# ============================================================
+# CONCEPT-BASED INTENT SCORING ENGINE
+# Instead of regex matching exact words, we detect CONCEPTS
+# (semantic groups of synonyms) and score each intent.
+# ============================================================
+
+# Concept → list of Vietnamese/English synonyms
+CONCEPTS = {
+    # --- Actions ---
+    "REMOVE":    ["xóa", "xoá", "delete", "dọn", "bỏ", "hủy", "loại", "loại bỏ", "dẹp", "xử lý",
+                  "clear", "clean", "sạch", "remove", "bỏ đi", "vứt", "thanh lọc", "lọc", "trừ", "kick"],
+    "CHECK":     ["check", "kiểm tra", "xem", "scan", "quét", "kiểm", "coi", "thử", "test", "verify",
+                  "dò", "rà", "rà soát", "soát", "tra", "xét"],
+    "OPEN":      ["mở", "open", "bật", "khởi động", "start", "launch", "run", "chạy"],
+    "CLOSE":     ["đóng", "close", "tắt", "kill", "stop", "dừng", "ngưng", "shut"],
+    "LIST":      ["list", "liệt kê", "danh sách", "xem", "show", "hiển thị", "có gì", "có những gì"],
+    "COUNT":     ["bao nhiêu", "mấy", "tổng", "count", "đếm", "còn", "tồn tại", "số lượng", "total"],
+    "NURTURE":   ["nuôi", "nurture", "dưỡng", "warm", "chăm", "chăm sóc", "tương tác", "farming", "farm"],
+    "LEAVE":     ["thoát", "leave", "rời", "out", "bỏ", "hủy", "unfollow"],
+    "WATCH":     ["xem", "watch", "lướt", "coi", "mở"],
+    
+    # --- Targets ---
+    "DIE":       ["die", "chết", "hỏng", "lỗi", "không login", "not log", "dead", "fail", "bay",
+                  "mất", "không vào", "bị khóa", "locked", "disabled", "restrict", "checkpoint",
+                  "không được", "hết hạn", "expired", "sập", "tạch", "toang", "tèo", "over"],
+    "LIVE":      ["live", "sống", "ok", "hoạt động", "active", "tốt", "ngon", "fine", "good",
+                  "còn sống", "đang sống", "vẫn sống", "healthy"],
+    "KEEP":      ["giữ", "keep", "để lại", "giữ lại", "bảo toàn", "không xóa", "giữ nguyên", "preserved"],
+    "ALL":       ["toàn bộ", "tất cả", "all", "hết", "mọi", "every", "toàn", "tất", "toàn thể",
+                  "toàn diện", "mọi thứ", "tất tần tật", "toàn bọn", "hết thảy", "cả"],
+    "FOLDER":    ["folder", "thư mục", "fb", "nhóm folder"],
+    "PROFILE":   ["profile", "profiles", "acc", "account", "tài khoản", "nick", "con"],
+    "GROUP":     ["group", "nhóm", "groups", "nh"],
+    "REEL":      ["reel", "reels", "video ngắn", "short"],
+    "FEED":      ["feed", "bảng tin", "newsfeed", "trang chủ", "home"],
+    "BROWSER":   ["browser", "trình duyệt", "chrome", "web"],
+    "TAG":       ["tag", "tags", "nhãn", "label"],
+    "SCRIPT":    ["script", "scripts", "kịch bản", "automation"],
+    "CAMPAIGN":  ["campaign", "campaigns", "chiến dịch"],
+    "RUNNING":   ["đang chạy", "running", "đang mở", "đang hoạt động"],
+    "VERSION":   ["version", "phiên bản", "versions"],
+    "SKILL":     ["skill", "skills", "kỹ năng", "đã học"],
+    "HISTORY":   ["lịch sử", "history", "log", "nhật ký"],
+    
+    # --- Modifiers ---
+    "COMMENT":   ["comment", "cmt", "bình luận", "phản hồi"],
+    "LIKE":      ["like", "thích"],
+    
+    # --- Agent targets ---
+    "NOTIFICATION": ["thông báo", "notification", "notif"],
+    "FRIEND":    ["bạn bè", "friend", "friends", "kết bạn"],
+    "MESSAGE":   ["tin nhắn", "message", "messenger", "nhắn tin", "chat"],
+    "POST":      ["đăng bài", "post", "bài viết", "viết bài", "status"],
+    "SEARCH":    ["tìm kiếm", "search", "tìm"],
+    "FOLLOW":    ["theo dõi", "follow"],
+    "SCREENSHOT": ["chụp", "screenshot", "cap", "snap", "màn hình"],
+    "VISION":    ["vision", "nhìn", "phân tích", "analyze"],
+    "CLICK":     ["click", "bấm", "nhấn", "ấn", "chọn"],
+    
+    # --- Follow-up / confirmation ---
+    "CONFIRM":   ["ok", "ừ", "ư", "ờ", "vâng", "yes", "y", "đi", "luôn", "ngay", "tiếp",
+                  "tiếp tục", "làm đi", "chạy đi", "go", "ok luôn", "làm luôn", "chạy luôn",
+                  "được", "thôi"],
+    "RETRY":     ["lại", "retry", "rerun", "thử lại", "làm lại", "check lại", "chạy lại",
+                  "lần nữa", "nữa"],
+    "RESULT":    ["kết quả", "rồi sao", "xong chưa", "sao rồi", "thế nào", "ok chưa",
+                  "xong", "ra sao", "kết quả sao"],
+}
+
+# Pre-compile concept patterns for speed
+_CONCEPT_PATTERNS = {}
+for concept, words in CONCEPTS.items():
+    # Sort by length (longest first) to match longer phrases before shorter ones
+    sorted_words = sorted(words, key=len, reverse=True)
+    # Escape regex special chars in each word
+    escaped = [re.escape(w) for w in sorted_words]
+    _CONCEPT_PATTERNS[concept] = re.compile(r'(?:' + '|'.join(escaped) + r')', re.IGNORECASE)
+
+
+def _detect_concepts(text_lower: str) -> set:
+    """Detect which semantic concepts appear in the text."""
+    found = set()
+    for concept, pattern in _CONCEPT_PATTERNS.items():
+        if pattern.search(text_lower):
+            found.add(concept)
+    return found
+
+
+# Intent scoring rules: (required_concepts, optional_boost_concepts, base_score)
+# Higher score wins. Required = must have ALL. Optional = bonus points.
+INTENT_RULES = {
+    # --- Delete die (folder or all) ---
+    "delete_die_all": {
+        "formulas": [
+            # "check toàn bộ die xóa live giữ"
+            ({"REMOVE", "DIE"}, {"ALL", "CHECK", "KEEP", "LIVE"}, 10),
+            # "dẹp hết mấy thằng chết"
+            ({"REMOVE", "DIE", "ALL"}, {"CHECK"}, 12),
+            # "check toàn bộ" alone (implicit = check + delete die)
+            ({"CHECK", "ALL"}, {"REMOVE", "DIE"}, 8),
+            # "loại bỏ toàn bộ die"
+            ({"REMOVE", "ALL"}, {"DIE"}, 7),
+            # "thanh lọc hết đi"  
+            ({"REMOVE", "ALL"}, set(), 5),
+        ],
+        "needs_no_folder": True,  # If folder specified → delete_die_profiles instead
+    },
+    "delete_die_profiles": {
+        "formulas": [
+            ({"REMOVE", "DIE"}, {"CHECK", "KEEP", "LIVE"}, 10),
+            ({"CHECK", "REMOVE"}, {"DIE"}, 8),
+            ({"REMOVE"}, {"DIE", "CHECK"}, 5),
+        ],
+        "needs_folder": True,
+    },
+    "batch_check_login": {
+        "formulas": [
+            ({"CHECK"}, {"PROFILE", "LIVE", "DIE"}, 6),
+        ],
+        "needs_folder": True,
+        "needs_no": {"REMOVE"},  # Don't match if user also wants to delete
+    },
+    "check_fb_status": {
+        "formulas": [
+            ({"CHECK"}, {"LIVE", "DIE"}, 6),
+        ],
+        "needs_profile": True,
+        "needs_no": {"REMOVE"},
+    },
+    "list_folders": {
+        "formulas": [
+            ({"COUNT", "PROFILE"}, set(), 8),
+            ({"COUNT"}, {"FOLDER", "ALL"}, 7),
+            ({"LIST", "FOLDER"}, set(), 8),
+            ({"COUNT"}, set(), 5),
+        ],
+        "needs_no_profile": True,
+    },
+    "list_profiles": {
+        "formulas": [
+            ({"LIST", "PROFILE"}, {"FOLDER"}, 8),
+        ],
+    },
+    "leave_groups": {
+        "formulas": [
+            ({"LEAVE", "GROUP"}, set(), 10),
+            ({"REMOVE", "GROUP"}, set(), 9),
+        ],
+        "needs_profile": True,
+    },
+    "debug_groups": {
+        "formulas": [
+            ({"LIST", "GROUP"}, set(), 9),
+            ({"CHECK", "GROUP"}, set(), 9),
+            ({"COUNT", "GROUP"}, set(), 8),
+        ],
+        "needs_profile": True,
+    },
+    "watch_reels": {
+        "formulas": [
+            ({"WATCH", "REEL"}, {"COMMENT", "LIKE"}, 10),
+        ],
+        "needs_profile": True,
+    },
+    "fb_nurture_batch": {
+        "formulas": [
+            ({"NURTURE"}, {"PROFILE", "COMMENT", "LIKE", "FEED"}, 10),
+            ({"FEED", "COMMENT"}, {"LIKE"}, 8),
+            ({"FEED", "LIKE"}, set(), 7),
+        ],
+    },
+    "fb_read_feed": {
+        "formulas": [
+            ({"WATCH", "FEED"}, set(), 8),
+            ({"LIST", "FEED"}, set(), 7),
+        ],
+        "needs_profile": True,
+    },
+    "open_browser": {
+        "formulas": [
+            ({"OPEN", "BROWSER"}, set(), 10),
+            ({"OPEN"}, {"BROWSER"}, 5),
+        ],
+        "needs_profile": True,
+    },
+    "close_browser": {
+        "formulas": [
+            ({"CLOSE", "BROWSER"}, set(), 10),
+            ({"CLOSE"}, {"BROWSER"}, 5),
+        ],
+        "needs_profile": True,
+    },
+    "screenshot": {
+        "formulas": [
+            ({"SCREENSHOT"}, set(), 8),
+        ],
+        "needs_profile": True,
+    },
+    "vision_click": {
+        "formulas": [
+            ({"VISION", "CLICK"}, set(), 10),
+            ({"CLICK"}, {"VISION"}, 6),
+        ],
+        "needs_profile": True,
+    },
+    "vision_capture": {
+        "formulas": [
+            ({"VISION", "SCREENSHOT"}, set(), 10),
+            ({"VISION"}, set(), 6),
+        ],
+        "needs_profile": True,
+    },
+    "list_tags": {
+        "formulas": [({"LIST", "TAG"}, set(), 8), ({"TAG"}, set(), 5)],
+        "needs_no_profile": True,
+    },
+    "list_scripts": {
+        "formulas": [({"LIST", "SCRIPT"}, set(), 8), ({"SCRIPT"}, set(), 5)],
+        "needs_no_profile": True,
+    },
+    "list_campaigns": {
+        "formulas": [({"LIST", "CAMPAIGN"}, set(), 8), ({"CAMPAIGN"}, set(), 5)],
+        "needs_no_profile": True,
+    },
+    "get_running": {
+        "formulas": [({"RUNNING"}, set(), 8)],
+        "needs_no_profile": True,
+    },
+    "get_versions": {
+        "formulas": [({"VERSION"}, set(), 8)],
+        "needs_no_profile": True,
+    },
+    "agent_skills": {
+        "formulas": [({"SKILL"}, set(), 8)],
+    },
+    "agent_task_history": {
+        "formulas": [({"HISTORY"}, {"SKILL"}, 7)],
+    },
+}
+
+# Agent catch-all concepts — if profile + any of these, → agent_execute
+AGENT_CONCEPTS = {"NOTIFICATION", "FRIEND", "MESSAGE", "POST", "SEARCH", "FOLLOW"}
+
+
 def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
-    """Smart Vietnamese intent detection. Handles 95% of cases without AI."""
+    """Smart Vietnamese intent detection using concept scoring."""
     text_lower = text.lower().strip()
     raw = text.strip()
     
-    # ===== ULTRA-SHORT / FOLLOW-UP (1-3 words) =====
-    # These MUST check history for context
-    if len(text_lower) < 30:
-        ctx = _get_last_context(chat_id) if chat_id else {}
-        last_folder = ctx.get("folder")
-        last_profile = ctx.get("profile")
-        
-        # "xóa" family
-        if re.search(r'^(xóa|xoá|delete|dọn|xóa hết|xóa đi|xóa luôn|xóa ngay|xoá hết|xoá luôn|xóa die|xóa chết|hết|xóa hết đi|dọn hết|xóa hết luôn|xóa sạch)\s*[!?.]*$', text_lower):
-            if last_folder:
-                return {"action": "delete_die_profiles", "params": {"folder_id": last_folder, "concurrency": 10}, "reply": f"🗑️ Xóa die {last_folder}..."}
-            return {"action": "delete_die_all", "params": {"concurrency": 10}, "reply": "🗑️ Xóa die toàn bộ..."}
-        
-        # "làm lại" / "check lại" / "thử lại"
-        if re.search(r'^(làm lại|thử lại|check lại|chạy lại|re.?run|retry)\s*[!?.]*$', text_lower):
-            if last_folder:
-                return {"action": "delete_die_all", "params": {"concurrency": 10}, "reply": f"🔄 Chạy lại..."}
-            return None  # Let AI handle
-        
-        # "rồi sao" / "xong chưa" / "kết quả"
-        if re.search(r'^(rồi sao|xong chưa|kết quả|sao rồi|thế nào|ok chưa|\?+)\s*$', text_lower):
-            # Return last result from history as chat
-            last_result = ctx.get("last_result", "")
-            if last_result:
-                return {"action": "chat", "params": {}, "reply": f"Kết quả lần trước: {last_result[:300]}"}
-            return {"action": "chat", "params": {}, "reply": "Chưa có kết quả nào trước đó bác ơi. Bác muốn check gì?"}
-        
-        # "tiếp" / "tiếp tục" / "đi" / "làm đi"
-        if re.search(r'^(tiếp|tiếp tục|làm đi|chạy đi|go|ok|\u0111i|làm luôn|chạy luôn|làm|y|yes|ư|ok luôn|vâng)\s*[!?.]*$', text_lower):
-            # Confirm previous suggestion → try to re-execute from context
-            if last_folder:
-                return {"action": "delete_die_profiles", "params": {"folder_id": last_folder, "concurrency": 10}, "reply": f"✅ OK, đang thực hiện cho {last_folder}..."}
-            return None
+    if not text_lower:
+        return None
+    
+    # ===== DETECT CONCEPTS =====
+    concepts = _detect_concepts(text_lower)
     
     # ===== EXTRACT ENTITIES =====
     profile_matches = re.findall(r'\b[sS]\s*(\d+)\b', raw)
@@ -1575,162 +1791,196 @@ def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
     folder_match = re.search(r'fb\s*(\d+)', text_lower)
     folder_id = f"fb{folder_match.group(1)}" if folder_match else None
     if not folder_id:
-        named = re.search(r'\b(fb\s*ok|fbok|fb\s*3|đông\s*hưng)\b', text_lower)
+        named = re.search(r'\b(fb\s*ok|fbok|đông\s*hưng)\b', text_lower)
         if named:
-            folder_id = named.group(1).strip()
+            n = named.group(1).strip().lower()
+            folder_map = {'fb ok': 'fb5', 'fbok': 'fb5', 'đông hưng': 'fb7'}
+            folder_id = folder_map.get(n, n)
     
     concurrency = _extract_concurrency(text_lower)
     
-    # ===== SMART COMBO DETECTION =====
-    # "check toàn bộ bật 20 luồng die thì xóa live thì giữ" → single delete_die_all
-    has_check = bool(re.search(r'check|kiểm tra|xem|scan', text_lower))
-    has_delete = bool(re.search(r'xóa|xoá|delete|dọn|hủy', text_lower))
-    has_die = bool(re.search(r'die|chết|không.*login|not.*log', text_lower))
-    has_live_keep = bool(re.search(r'live.*giữ|giữ.*live|sống.*giữ|giữ.*sống', text_lower))
-    has_all = bool(re.search(r'toàn bộ|tất cả|all|hết|mọi|every|tất', text_lower))
+    # ===== FOLLOW-UP / SHORT COMMANDS (use history context) =====
+    ctx = _get_last_context(chat_id) if chat_id else {}
+    last_folder = ctx.get("folder")
+    last_profile = ctx.get("profile")
     
-    # Combo: check + die/xóa → delete_die
-    if (has_check and has_die and has_delete) or (has_die and has_delete) or (has_check and has_delete) or (has_check and has_die and has_live_keep):
-        if folder_id and not has_all:
-            return {"action": "delete_die_profiles", "params": {"folder_id": folder_id, "concurrency": concurrency}, "reply": f"🗑️ Check {folder_id} ({concurrency} luồng), die xóa live giữ..."}
-        return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🗑️ Check TOÀN BỘ ({concurrency} luồng), die xóa live giữ..."}
+    # Pure follow-up: only CONFIRM/RETRY/RESULT concepts, nothing else substantive
+    action_concepts = concepts - {"CONFIRM", "RETRY", "RESULT", "ALL", "KEEP", "LIVE"}
     
-    # Check + all (without explicit die mention) → still delete_die_all (user wants to see status)
-    if has_check and has_all and not folder_id:
-        return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🔍 Check TOÀN BỘ ({concurrency} luồng)..."}
-
-    # ===== GROUPS =====
-    if profile and re.search(r'thoát.*nhóm|leave.*group|rời.*nhóm|out.*group|xóa.*nhóm|hủy.*nhóm|bỏ.*nhóm', text_lower):
-        return {"action": "leave_groups", "params": {"profile": profile}, "reply": f"⏳ Đang thoát hết nhóm cho {profile}..."}
-    if profile and re.search(r'xem.*group|debug.*group|list.*group|kiểm tra.*nhóm|liệt kê.*nhóm|bao nhiêu.*nhóm|nhóm.*đã.*tham gia|group', text_lower):
-        return {"action": "debug_groups", "params": {"profile": profile}, "reply": f"🔍 Đang xem groups {profile}..."}
-
-    # ===== REELS =====
-    if profile and re.search(r'xem.*reel|watch.*reel|lướt.*reel|mở.*reel|coi.*reel', text_lower):
-        do_comment = bool(re.search(r'comment|cmt|bình luận', text_lower))
-        count_match = re.search(r'(\d+)\s*(?:cái|reel|video)', text_lower)
-        count = int(count_match.group(1)) if count_match else 5
-        return {"action": "watch_reels", "params": {"profile": profile, "count": count, "comment": do_comment, "comment_count": 3}, "reply": f"🎬 Đang xem {count} reels cho {profile}..."}
-
-    # ===== FEED & NURTURE =====
-    # If user mentions feed/bảng tin + comment/like → nurture (full flow)
-    if profile and re.search(r'đọc.*feed|xem.*feed|lướt.*feed|read.*feed|newsfeed|bảng tin', text_lower):
-        has_interact = bool(re.search(r'cmt|comment|bình luận|like|thích|tương tác|ngẫu nhiên', text_lower))
-        if has_interact:
-            return {"action": "fb_nurture_batch", "params": {"profiles": [profile], "max_workers": 1, "comments_per_profile": 2}, "reply": f"🌱 Đang nuôi {profile} (lướt feed + cmt + like)..."}
-        return {"action": "fb_read_feed", "params": {"profile": profile, "scroll_count": 3}, "reply": f"📰 Đang đọc feed {profile}..."}
+    if len(text_lower) < 40 and not action_concepts:
+        # "ok", "làm đi", "tiếp", "chạy luôn"
+        if "CONFIRM" in concepts:
+            if last_folder:
+                return {"action": "delete_die_profiles", "params": {"folder_id": last_folder, "concurrency": 10},
+                        "reply": f"✅ OK, đang thực hiện cho {last_folder}..."}
+            return None
+        
+        # "làm lại", "thử lại", "check lại"
+        if "RETRY" in concepts:
+            if last_folder:
+                return {"action": "delete_die_all", "params": {"concurrency": 10}, "reply": "🔄 Chạy lại..."}
+            return None
+        
+        # "rồi sao?", "xong chưa?", "kết quả?"
+        if "RESULT" in concepts or text_lower.strip('?!. ') == '':
+            last_result = ctx.get("last_result", "")
+            if last_result:
+                return {"action": "chat", "params": {}, "reply": f"Kết quả lần trước: {last_result[:300]}"}
+            return {"action": "chat", "params": {}, "reply": "Chưa có kết quả nào trước đó bác ơi. Bác muốn check gì?"}
     
-    # Nurture (nuôi)
-    if re.search(r'nuôi|nurture|dưỡng|warm.?up', text_lower):
-        if profile:
-            return {"action": "fb_nurture_batch", "params": {"profiles": [profile], "max_workers": 1, "comments_per_profile": 2}, "reply": f"🌱 Đang nuôi {profile}..."}
-        elif folder_id:
-            return None  # Let AI handle batch nurture with folder
-
-    # ===== BROWSER =====
-    if profile and re.search(r'mở.*browser|open.*browser|mở trình duyệt|bật.*browser', text_lower):
-        return {"action": "open_browser", "params": {"profile": profile}, "reply": f"🌐 Đang mở browser {profile}..."}
+    # Short "xóa/remove" without explicit target → from context
+    if len(text_lower) < 30 and "REMOVE" in concepts and not folder_id and not profile:
+        if last_folder:
+            return {"action": "delete_die_profiles", "params": {"folder_id": last_folder, "concurrency": 10},
+                    "reply": f"🗑️ Xóa die {last_folder}..."}
+        return {"action": "delete_die_all", "params": {"concurrency": 10}, "reply": "🗑️ Xóa die toàn bộ..."}
     
-    if profile and re.search(r'đóng.*browser|close.*browser|tắt.*browser|kill.*browser', text_lower):
-        return {"action": "close_browser", "params": {"profile": profile}, "reply": f"🔒 Đang đóng browser {profile}..."}
-
-    # ===== LOGIN & STATUS =====
-    if profile and re.search(r'check|status|kiểm tra|trạng thái|live.*die|die.*live|login|còn.*sống|xem', text_lower):
-        return {"action": "check_fb_status", "params": {"profile": profile}, "reply": f"🔍 Đang check {profile}..."}
-    
-    # Batch check login (folder-level) — "check fb3", "kiểm tra fb1 20 luồng"
-    if folder_id and re.search(r'check|kiểm tra|bao nhiêu.*live|live.*die|die.*live|xem|scan', text_lower):
-        return {"action": "batch_check_login", "params": {"folder_id": folder_id, "concurrency": concurrency}, "reply": f"🔍 Đang check {folder_id} ({concurrency} luồng)..."}
-
-    # ===== SCREENSHOT =====
-    if profile and re.search(r'chụp|screenshot|cap|snap|màn hình', text_lower):
-        return {"action": "screenshot", "params": {"profile": profile}, "reply": f"📸 Đang chụp {profile}..."}
-
-    # ===== VISION =====
-    if profile and re.search(r'vision.*click|click.*vision|tìm.*click|tìm.*nút|click.*nút|bấm.*nút|nhấn.*nút', text_lower):
-        # Extract target description after keywords
-        target_match = re.search(r'(?:click|bấm|nhấn|tìm)\s+(?:vào\s+)?(?:nút\s+)?["\']?(.+?)["\']?\s*$', text_lower)
-        target = target_match.group(1).strip() if target_match else ""
-        if not target:
-            return None  # Let AI extract target
-        return {"action": "vision_click", "params": {"profile": profile, "target": target}, "reply": f"🎯 Đang tìm và click '{target}'..."}
-    
-    if profile and re.search(r'vision.*capture|chụp.*vision|phân tích.*dom|phân tích.*giao diện|analyze', text_lower):
-        return {"action": "vision_capture", "params": {"profile": profile}, "reply": f"📸 Đang chụp vision {profile}..."}
-
-    # ===== CHECK + DELETE DIE =====
-    if has_die or has_delete:
-        if folder_id:
-            return {"action": "delete_die_profiles", "params": {"folder_id": folder_id, "concurrency": concurrency}, "reply": f"🗑️ Check {folder_id} ({concurrency} luồng), xóa die..."}
-        if has_all:
-            return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🗑️ Check toàn bộ ({concurrency} luồng), xóa die..."}
-
-    # ===== DELETE DIE =====
-    if re.search(r'xóa|xoá|delete|dọn', text_lower) and re.search(r'die|chết', text_lower):
-        if has_all or not folder_id:
-            return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🗑️ Xóa die toàn bộ ({concurrency} luồng)..."}
-        return {"action": "delete_die_profiles", "params": {"folder_id": folder_id, "concurrency": concurrency}, "reply": f"🗑️ Xóa die {folder_id} ({concurrency} luồng)..."}
-
-    # ===== COUNT / SUMMARY =====
-    if re.search(r'tổng|còn bao nhiêu|bao nhiêu.*profile|bao nhiêu.*acc|mấy.*profile|count|còn.*mấy', text_lower) and not profile:
-        return {"action": "list_folders", "params": {}, "reply": "📊 Đang đếm profiles..."}
-
-    # ===== CHECK TOÀN BỘ =====
-    if has_check and has_all and not folder_id:
-        return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🔍 Check TOÀN BỘ ({concurrency} luồng)..."}
-
-    # ===== LIST FOLDERS =====
-    if re.search(r'thư mục|folder|bao nhiêu.*fb|mấy.*fb|các fb|list.*folder|danh sách.*folder', text_lower) and not profile:
-        return {"action": "list_folders", "params": {}, "reply": "📁 Đang lấy danh sách thư mục..."}
-
-    # ===== LIST TAGS =====
-    if re.search(r'list.*tag|danh sách.*tag|xem.*tag|có.*tag|tags', text_lower) and not profile:
-        return {"action": "list_tags", "params": {}, "reply": "🏷️ Đang lấy danh sách tags..."}
-
-    # ===== LIST SCRIPTS =====
-    if re.search(r'list.*script|danh sách.*script|xem.*script|scripts|kịch bản', text_lower) and not profile:
-        return {"action": "list_scripts", "params": {}, "reply": "📜 Đang lấy danh sách scripts..."}
-
-    # ===== LIST CAMPAIGNS =====
-    if re.search(r'list.*campaign|danh sách.*campaign|xem.*campaign|campaigns|chiến dịch', text_lower) and not profile:
-        return {"action": "list_campaigns", "params": {}, "reply": "📋 Đang lấy danh sách campaigns..."}
-
-    # ===== GET RUNNING =====
-    if re.search(r'đang chạy|running|đang mở|profile.*mở|browser.*mở|bao nhiêu.*mở', text_lower) and not profile:
-        return {"action": "get_running", "params": {}, "reply": "🟢 Đang xem profiles đang chạy..."}
-
-    # ===== GET VERSIONS =====
-    if re.search(r'version|phiên bản|browser version', text_lower) and not profile:
-        return {"action": "get_versions", "params": {}, "reply": "🌐 Đang xem phiên bản browser..."}
-
-    # ===== LIST PROFILES =====
-    if re.search(r'liệt kê.*profile|list.*profile|profiles|danh sách.*profile', text_lower):
-        return {"action": "list_profiles", "params": {"folder_id": folder_id}, "reply": "📱 Đang lấy danh sách profiles..."}
-
-    # ===== AGENT SKILLS =====
-    if re.search(r'skills?|kỹ năng|đã học|agent.*học', text_lower):
-        return {"action": "agent_skills", "params": {}, "reply": "🧠 Đang xem skills agent đã học..."}
-
-    # ===== AGENT HISTORY =====
-    if re.search(r'lịch sử.*agent|agent.*history|task.*log|agent.*log', text_lower):
-        return {"action": "agent_task_history", "params": {"limit": 10}, "reply": "📜 Đang xem lịch sử agent..."}
-
-    # ===== AGENT (catch-all: profile + action-like keywords not matched above) =====
-    if profile and re.search(
-        r'thông báo|notification|bạn bè|friend|tin nhắn|message|messenger|'
-        r'marketplace|watch|story|stories|trang cá nhân|profile|'
-        r'chấp nhận|accept|xác nhận|confirm|từ chối|decline|'
-        r'gửi tin|send.*message|nhắn tin|đăng bài|post|'
-        r'tìm kiếm|search|xem.*trang|visit|theo dõi|follow|'
-        r'hủy kết bạn|unfriend|chặn|block|báo cáo|report', text_lower):
-        # Remove profile from text to get task description
-        task = re.sub(r'\b[sS]\s*\d+\b', '', text).strip()
+    # ===== AGENT PRIORITY: If profile + specific agent targets → agent_execute =====
+    # These override generic "check/xem" intents
+    if profile and concepts & AGENT_CONCEPTS:
+        task = re.sub(r'\b[sS]\s*\d+\b', '', raw).strip()
         task = re.sub(r'\b[aA]\s*\d+\b', '', task).strip()
         if task:
             return {"action": "agent_execute", "params": {"profile": profile, "task": task},
                     "reply": f"🤖 Agent đang thực hiện cho {profile}..."}
+    
+    # ===== SCORE ALL INTENTS =====
+    scores = {}
+    for intent, rule in INTENT_RULES.items():
+        # Check entity constraints
+        if rule.get("needs_profile") and not profile:
+            continue
+        if rule.get("needs_folder") and not folder_id:
+            continue
+        if rule.get("needs_no_profile") and profile:
+            continue
+        if rule.get("needs_no_folder") and folder_id:
+            # Special: delete_die_all needs no folder, but if folder → use delete_die_profiles
+            continue
+        if rule.get("needs_no"):
+            if concepts & rule["needs_no"]:
+                continue
+        
+        best_score = 0
+        for required, optional, base in rule["formulas"]:
+            if required.issubset(concepts):
+                score = base + len(concepts & optional) * 2
+                best_score = max(best_score, score)
+        
+        if best_score > 0:
+            scores[intent] = best_score
+    
+    if not scores:
+        # Check agent catch-all
+        if profile and concepts & AGENT_CONCEPTS:
+            task = re.sub(r'\b[sS]\s*\d+\b', '', raw).strip()
+            task = re.sub(r'\b[aA]\s*\d+\b', '', task).strip()
+            if task:
+                return {"action": "agent_execute", "params": {"profile": profile, "task": task},
+                        "reply": f"🤖 Agent đang thực hiện cho {profile}..."}
+        return None  # Let AI handle
+    
+    # Pick highest score
+    best_intent = max(scores, key=scores.get)
+    logger.info(f"Intent scores: {scores} → winner: {best_intent} (score={scores[best_intent]})")
+    
+    # ===== BUILD RESPONSE =====
+    return _build_action(best_intent, concepts, profile, folder_id, concurrency, text_lower, raw)
 
-    return None  # Let AI handle it
+
+def _build_action(intent: str, concepts: set, profile: str, folder_id: str,
+                   concurrency: int, text_lower: str, raw: str) -> dict:
+    """Build the action dict for the winning intent."""
+    
+    if intent == "delete_die_all":
+        return {"action": "delete_die_all", "params": {"concurrency": concurrency},
+                "reply": f"🗑️ Check TOÀN BỘ ({concurrency} luồng), die xóa live giữ..."}
+    
+    if intent == "delete_die_profiles":
+        return {"action": "delete_die_profiles", "params": {"folder_id": folder_id, "concurrency": concurrency},
+                "reply": f"🗑️ Check {folder_id} ({concurrency} luồng), die xóa live giữ..."}
+    
+    if intent == "batch_check_login":
+        return {"action": "batch_check_login", "params": {"folder_id": folder_id, "concurrency": concurrency},
+                "reply": f"🔍 Đang check {folder_id} ({concurrency} luồng)..."}
+    
+    if intent == "check_fb_status":
+        return {"action": "check_fb_status", "params": {"profile": profile},
+                "reply": f"🔍 Đang check {profile}..."}
+    
+    if intent == "list_folders":
+        return {"action": "list_folders", "params": {}, "reply": "📁 Đang lấy danh sách thư mục..."}
+    
+    if intent == "list_profiles":
+        return {"action": "list_profiles", "params": {"folder_id": folder_id},
+                "reply": "📱 Đang lấy danh sách profiles..."}
+    
+    if intent == "leave_groups":
+        return {"action": "leave_groups", "params": {"profile": profile},
+                "reply": f"⏳ Đang thoát hết nhóm cho {profile}..."}
+    
+    if intent == "debug_groups":
+        return {"action": "debug_groups", "params": {"profile": profile},
+                "reply": f"🔍 Đang xem groups {profile}..."}
+    
+    if intent == "watch_reels":
+        do_comment = "COMMENT" in concepts
+        count_match = re.search(r'(\d+)\s*(?:cái|reel|video)', text_lower)
+        count = int(count_match.group(1)) if count_match else 5
+        return {"action": "watch_reels", "params": {"profile": profile, "count": count,
+                "comment": do_comment, "comment_count": 3},
+                "reply": f"🎬 Đang xem {count} reels cho {profile}..."}
+    
+    if intent == "fb_nurture_batch":
+        profiles_list = [profile] if profile else []
+        return {"action": "fb_nurture_batch", "params": {"profiles": profiles_list, "max_workers": 1,
+                "comments_per_profile": 2},
+                "reply": f"🌱 Đang nuôi {profile or 'profiles'}..."}
+    
+    if intent == "fb_read_feed":
+        return {"action": "fb_read_feed", "params": {"profile": profile, "scroll_count": 3},
+                "reply": f"📰 Đang đọc feed {profile}..."}
+    
+    if intent == "open_browser":
+        return {"action": "open_browser", "params": {"profile": profile},
+                "reply": f"🌐 Đang mở browser {profile}..."}
+    
+    if intent == "close_browser":
+        return {"action": "close_browser", "params": {"profile": profile},
+                "reply": f"🔒 Đang đóng browser {profile}..."}
+    
+    if intent == "screenshot":
+        return {"action": "screenshot", "params": {"profile": profile},
+                "reply": f"📸 Đang chụp {profile}..."}
+    
+    if intent == "vision_click":
+        target_match = re.search(r'(?:click|bấm|nhấn|tìm|ấn|chọn)\s+(?:vào\s+)?(?:nút\s+)?(.+?)$', text_lower)
+        target = target_match.group(1).strip() if target_match else ""
+        if not target:
+            return None  # Let AI extract
+        return {"action": "vision_click", "params": {"profile": profile, "target": target},
+                "reply": f"🎯 Đang tìm và click '{target}'..."}
+    
+    if intent == "vision_capture":
+        return {"action": "vision_capture", "params": {"profile": profile},
+                "reply": f"📸 Đang phân tích giao diện {profile}..."}
+    
+    if intent == "list_tags":
+        return {"action": "list_tags", "params": {}, "reply": "🏷️ Đang lấy danh sách tags..."}
+    if intent == "list_scripts":
+        return {"action": "list_scripts", "params": {}, "reply": "📜 Đang lấy danh sách scripts..."}
+    if intent == "list_campaigns":
+        return {"action": "list_campaigns", "params": {}, "reply": "📋 Đang lấy danh sách campaigns..."}
+    if intent == "get_running":
+        return {"action": "get_running", "params": {}, "reply": "🟢 Đang xem profiles đang chạy..."}
+    if intent == "get_versions":
+        return {"action": "get_versions", "params": {}, "reply": "🌐 Đang xem phiên bản browser..."}
+    if intent == "agent_skills":
+        return {"action": "agent_skills", "params": {}, "reply": "🧠 Đang xem skills..."}
+    if intent == "agent_task_history":
+        return {"action": "agent_task_history", "params": {"limit": 10}, "reply": "📜 Đang xem lịch sử..."}
+    
+    return None
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
