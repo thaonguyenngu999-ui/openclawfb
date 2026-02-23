@@ -1759,7 +1759,7 @@ CONCEPTS = {
                   "dò", "rà", "rà soát", "soát", "tra", "xét"],
     "OPEN":      ["mở", "open", "bật", "khởi động", "start", "launch", "run", "chạy"],
     "CLOSE":     ["đóng", "close", "tắt", "kill", "stop", "dừng", "ngưng", "shut"],
-    "LIST":      ["list", "liệt kê", "danh sách", "xem", "show", "hiển thị", "có gì", "có những gì"],
+    "LIST":      ["list", "liệt kê", "danh sách", "show", "hiển thị", "có gì", "có những gì"],
     "COUNT":     ["bao nhiêu", "mấy", "tổng", "count", "đếm", "còn", "tồn tại", "số lượng", "total"],
     "NURTURE":   ["nuôi", "nurture", "dưỡng", "warm", "chăm", "chăm sóc", "tương tác", "farming", "farm"],
     "LEAVE":     ["thoát", "leave", "rời", "out", "bỏ", "hủy", "unfollow"],
@@ -1876,7 +1876,7 @@ INTENT_RULES = {
     },
     "batch_check_login": {
         "formulas": [
-            ({"CHECK"}, {"PROFILE", "LIVE", "DIE"}, 6),
+            ({"CHECK"}, {"PROFILE", "LIVE", "DIE", "WATCH"}, 8),
         ],
         "needs_folder": True,
         "needs_no": {"REMOVE"},  # Don't match if user also wants to delete
@@ -1896,6 +1896,7 @@ INTENT_RULES = {
             ({"COUNT"}, set(), 5),
         ],
         "needs_no_profile": True,
+        "needs_no_folder": True,  # If user specifies a folder, they want to CHECK it, not list all
     },
     "list_profiles": {
         "formulas": [
