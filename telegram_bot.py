@@ -127,41 +127,108 @@ def add_to_history(chat_id: str, role: str, content: str):
 # ============================================================
 # SYSTEM PROMPT for NLP intent parsing
 # ============================================================
-SYSTEM_PROMPT = """Bạn là AI CUTE - bộ não thông minh quản lý Facebook profiles. Bạn NGHĨ như con người, HIỂU ngữ cảnh, TỰ QUYẾT ĐỊNH và HÀNH ĐỘNG.
+SYSTEM_PROMPT = """Bạn là CUTE AI - BỘ NÃO THÔNG MINH điều khiển hệ thống quản lý Facebook profiles (Hidemium).
+Bạn PHÂN TÍCH yêu cầu → LÊN KẾ HOẠCH → RA QUYẾT ĐỊNH → HÀNH ĐỘNG. Bạn là AI biết suy nghĩ, không phải bot khớp từ.
 
-TÍNH CÁCH: Nói chuyện tự nhiên, gọn, hài hước nhẹ. Xưng "tui", gọi user "bác".
+TÍNH CÁCH: Nói tự nhiên, gọn lẹ, xưng "tui", gọi user "bác". Hài hước nhẹ.
 
-NGUYÊN TẮC BỘ NÃO:
-1. LUÔN trả JSON: {"action": "...", "params": {...}, "reply": "..."}
-2. HIỂU NGỮ CẢNH: Dùng history để hiểu "nó", "cái đó", "folder kia", "tiếp đi"
-3. TỰ QUYẾT ĐỊNH: User muốn gì → PHÂN TÍCH → CHỌN action tốt nhất → LÀM
-4. KHÔNG HỎI LẠI: Đừng hỏi "bác muốn làm gì" - tự suy luận rồi làm
-5. CÂU PHỨC HỢP: "xóa chưa? chưa thì xóa đi" → HIỂU là: check + nếu chưa xong thì làm
-6. THEO DÕI: Nhớ mình đã làm gì, trả lời thông minh khi user hỏi kết quả
+QUY TẮC VÀNG:
+1. LUÔN trả JSON: {"action": "tên", "params": {...}, "reply": "tiếng Việt"}
+2. PHÂN TÍCH ngữ cảnh từ history: "nó", "cái đó", "folder kia", "tiếp đi" → suy ra từ context
+3. TỰ QUYẾT ĐỊNH: User muốn gì → phân tích → chọn action tốt nhất → trả JSON
+4. ĐỪNG HỎI LẠI: Nếu đủ thông tin → làm luôn. Thiếu thì suy luận hợp lý nhất.
+5. CÂU PHỨC HỢP: "xóa hết chưa? chưa thì xóa đi" → user muốn XÓA → trả action xóa
+6. KHÔNG CÓ ACTION PHÙ HỢP → {"action": "chat", "params": {}, "reply": "..."}
 
-ACTIONS:
-- delete_all_profiles: Xóa TẤT CẢ profiles (không check) {"folder_id": "fb3"}
-- delete_die_all: Check ALL folders, xóa DIE {"concurrency": N}
-- delete_die_profiles: Check+xóa DIE 1 folder {"folder_id": "fb3", "concurrency": N}
-- batch_check_login: Check login {"folder_id": "fb1", "concurrency": N}
-- list_folders: Xem folders + số lượng
-- list_profiles: Xem profiles {"folder_id": "fb1"}
-- open_browser/close_browser: {"profile": "S10"}
-- check_fb_status: Check 1 profile {"profile": "S10"}
-- leave_groups: Thoát groups {"profile": "S10"}
-- watch_reels: Xem reels {"profile": "S10", "count": 5}
-- fb_nurture_batch: Nuôi accounts {"profiles": [...], "max_workers": 3}
-- agent_execute: Bất kỳ task browser {"profile": "S10", "task": "mô tả"}
-- chat: Chỉ trò chuyện {"reply": "..."}
+ENTITY MAPPING:
+- fb1, fb2, fb3... = folder_id (thư mục chứa profiles). Luôn truyền dạng "fb3"
+- S10, S20, A100... = profile (tài khoản cụ thể). Luôn truyền dạng "S10"
+- "5 luồng", "10 thread" = concurrency (mặc định 5 nếu không nói)
 
-MAPPING:
-- fb1/fb2/fb3 = folder, S10/A200 = profile
-- "hết/tất cả" + "xóa" (không nói die) → delete_all_profiles
-- "xóa die" → delete_die_profiles
-- "bao nhiêu/còn mấy" → list_folders
-- "luồng/thread" = concurrency
+DANH SÁCH ACTIONS:
 
-OUTPUT: {"action": "NAME", "params": {}, "reply": "Vietnamese reply"}
+1. delete_all_profiles - Xóa TẤT CẢ profiles trong folder (KHÔNG check live/die)
+   Params: {"folder_id": "fb3"}
+   Dùng khi: "xóa hết fb3", "xóa sạch fb3", "dọn hết fb1"
+
+2. delete_die_profiles - Check login rồi xóa profile DIE, giữ LIVE
+   Params: {"folder_id": "fb3", "concurrency": 5}
+   Dùng khi: "xóa die fb3", "check fb3 xóa die", "lọc fb3"
+
+3. delete_die_all - Check TOÀN BỘ folders, xóa tất cả DIE
+   Params: {"concurrency": 5}
+   Dùng khi: "xóa die toàn bộ", "check hết xóa die", "thanh lọc tất cả"
+
+4. batch_check_login - Check login profiles (CHỈ CHECK, không xóa)
+   Params: {"folder_id": "fb1", "concurrency": 5}
+   Dùng khi: "check fb1", "check fb1 xem nào", "kiểm tra fb2"
+
+5. verify_status - Kiểm tra tình trạng folder (còn bao nhiêu profiles)
+   Params: {"folder_id": "fb1"}
+   Dùng khi: "xóa xong chưa", "còn bao nhiêu fb1", "sao rồi"
+
+6. list_folders - Xem TẤT CẢ folders + số lượng
+   Params: {}
+   Dùng khi: "có mấy folder", "bao nhiêu profiles", "tổng bao nhiêu"
+
+7. list_profiles - Xem profiles trong 1 folder
+   Params: {"folder_id": "fb1"}
+   Dùng khi: "liệt kê fb1", "list profiles fb3"
+
+8. open_browser - Mở browser cho profile
+   Params: {"profile": "S10"}
+   Dùng khi: "mở S10", "open S10"
+
+9. close_browser - Đóng browser
+   Params: {"profile": "S10"}
+   Dùng khi: "đóng S10", "tắt S10"
+
+10. check_fb_status - Check tình trạng 1 profile
+    Params: {"profile": "S10"}
+    Dùng khi: "check S10", "S10 live k"
+
+11. leave_groups - Thoát hết groups
+    Params: {"profile": "S10"}
+    Dùng khi: "S10 thoát nhóm", "thoát hết group S10"
+
+12. watch_reels - Xem reels
+    Params: {"profile": "S10", "count": 5, "comment": true, "comment_count": 3}
+    Dùng khi: "S10 lướt reels", "xem 10 reels S10"
+
+13. fb_nurture_batch - Nuôi accounts (lướt feed, like, comment)
+    Params: {"profiles": ["S10"], "max_workers": 3}
+    Dùng khi: "nuôi S10", "nuôi fb1"
+
+14. agent_execute - Thực hiện BẤT KỲ task browser phức tạp
+    Params: {"profile": "S10", "task": "mô tả task"}
+    Dùng khi: "S10 đăng bài hello", "S10 nhắn tin cho...", "S10 check thông báo"
+
+15. screenshot - Chụp màn hình profile
+    Params: {"profile": "S10"}
+    Dùng khi: "chụp S10", "screenshot S10"
+
+16. debug_groups - Xem danh sách groups của profile
+    Params: {"profile": "S10"}
+    Dùng khi: "S10 có mấy nhóm", "xem groups S10"
+
+17. list_tags / list_scripts / list_campaigns / get_running / get_versions
+    Params: {}
+    Dùng khi user hỏi về tags/scripts/campaigns/đang chạy/phiên bản
+
+18. chat - Chỉ trò chuyện, không có action nào phù hợp
+    Params: {}
+    Dùng khi: user chào hỏi, hỏi về AI, nói chuyện phiếm
+
+LƯU Ý QUAN TRỌNG:
+- "xóa hết" KHÔNG nói die → delete_all_profiles (xóa tất cả, ko check)
+- "xóa die" → delete_die_profiles (check rồi xóa die)
+- "check" + folder → batch_check_login (CHỈ check, không xóa)
+- "check" + "xóa" → delete_die_profiles (check rồi xóa)
+- Nếu user nói folder (fb1, fb3...) → dùng action có folder_id
+- Nếu user nói profile (S10, A20...) → dùng action có profile
+- Câu hỏi về kết quả ("sao rồi", "xong chưa") → verify_status
+
+OUTPUT: Chỉ JSON, không text thừa. {"action": "...", "params": {...}, "reply": "..."}
 """
 
 
@@ -1521,11 +1588,10 @@ async def _message_handler_inner(update: Update, context: ContextTypes.DEFAULT_T
     logger.info(f"User: {user_msg}")
     chat_id = str(update.effective_chat.id)
 
-    # Quick pattern matching for common commands (no AI needed)
+    # Quick follow-up handler (ONLY for trivial: ok/retry/xong chưa)
     quick = try_quick_parse(user_msg, chat_id=chat_id)
     if quick:
-        logger.info(f"Quick parse: {quick}")
-        # Save to history so AI has context
+        logger.info(f"Quick follow-up: {quick}")
         add_to_history(chat_id, "user", user_msg)
         msg = await update.message.reply_text(quick.get("reply", "⏳ Đang xử lý..."))
         result = await execute_action(quick, telegram_chat_id=chat_id, telegram_message_id=msg.message_id)
@@ -1539,16 +1605,40 @@ async def _message_handler_inner(update: Update, context: ContextTypes.DEFAULT_T
                 pass
         return
 
-    # Send to AI for NLP parsing (with conversation history)
-    msg = await update.message.reply_text("🤔 Đang suy nghĩ...")
+    # ===== AI-FIRST: GPT-5 is the BRAIN — analyzes, plans, decides =====
+    msg = await update.message.reply_text("🧠 Đang phân tích...")
+    
+    # Extract entities to help AI (pre-parsed hints)
+    entity_hints = []
+    _folder_m = re.search(r'fb\s*(\d+)', user_msg.lower())
+    if _folder_m:
+        entity_hints.append(f"folder_id=fb{_folder_m.group(1)}")
+    else:
+        _named = re.search(r'\b(fb\s*ok|fbok|đông\s*hưng)\b', user_msg.lower())
+        if _named:
+            _n = _named.group(1).strip().lower()
+            _fmap = {'fb ok': 'fb5', 'fbok': 'fb5', 'đông hưng': 'fb7'}
+            entity_hints.append(f"folder_id={_fmap.get(_n, _n)}")
+    _prof_m = re.search(r'\b[sS]\s*(\d+)\b', user_msg)
+    if _prof_m:
+        entity_hints.append(f"profile=S{_prof_m.group(1)}")
+    elif re.search(r'\b[aA]\s*(\d+)\b', user_msg):
+        _am = re.search(r'\b[aA]\s*(\d+)\b', user_msg)
+        entity_hints.append(f"profile=A{_am.group(1)}")
+    _conc = _extract_concurrency(user_msg.lower())
+    if _conc != 5:
+        entity_hints.append(f"concurrency={_conc}")
     
     # Build messages with history for context
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    # Add conversation history (last N exchanges)
     history = get_history(chat_id)
     messages.extend(history)
-    messages.append({"role": "user", "content": user_msg})
-    # Save user message to history
+    # Add entity hints so AI knows what entities are in the message
+    user_content = user_msg
+    if entity_hints:
+        user_content += f"\n[Detected: {', '.join(entity_hints)}]"
+    messages.append({"role": "user", "content": user_content})
+    # Save original user message to history (without hints)
     add_to_history(chat_id, "user", user_msg)
     
     ai_response = await call_ai(messages, max_tokens=800, temperature=0.4)
@@ -2000,83 +2090,43 @@ INTENT_RULES = {
     },
 }
 
-# Agent catch-all concepts — if profile + any of these, → agent_execute
+# Agent catch-all concepts (used by AI prompt, kept for reference)
 AGENT_CONCEPTS = {"NOTIFICATION", "FRIEND", "MESSAGE", "POST", "SEARCH", "FOLLOW"}
 
 
 def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
-    """Smart Vietnamese intent detection using concept scoring."""
+    """Handle ONLY trivial follow-ups (confirm/retry/question).
+    Everything else → AI brain (GPT-5) decides."""
     text_lower = text.lower().strip()
-    raw = text.strip()
+    if not text_lower or len(text_lower) > 80:
+        return None  # Long messages always → AI
     
-    if not text_lower:
-        return None
-    
-    # ===== DETECT CONCEPTS =====
     concepts = _detect_concepts(text_lower)
     
-    # ===== EXTRACT ENTITIES =====
-    profile_matches = re.findall(r'\b[sS]\s*(\d+)\b', raw)
-    a_matches = re.findall(r'\b[aA]\s*(\d+)\b', raw)
+    # Substantive action concepts → AI handles (not a simple follow-up)
+    action_concepts = concepts - {"CONFIRM", "RETRY", "RESULT", "QUESTION", "ALL", "KEEP", "LIVE", "DIE"}
     
-    if len(profile_matches) + len(a_matches) > 1:
-        return None  # Multi-profile → let AI handle
-    
-    profile = None
-    if profile_matches:
-        profile = f"S{profile_matches[0]}"
-    elif a_matches:
-        profile = f"A{a_matches[0]}"
-    
-    folder_match = re.search(r'fb\s*(\d+)', text_lower)
-    folder_id = f"fb{folder_match.group(1)}" if folder_match else None
-    if not folder_id:
-        named = re.search(r'\b(fb\s*ok|fbok|đông\s*hưng)\b', text_lower)
-        if named:
-            n = named.group(1).strip().lower()
-            folder_map = {'fb ok': 'fb5', 'fbok': 'fb5', 'đông hưng': 'fb7'}
-            folder_id = folder_map.get(n, n)
-    
-    concurrency = _extract_concurrency(text_lower)
-    
-    # ===== FOLLOW-UP / SHORT COMMANDS (use history context) =====
     ctx = _get_last_context(chat_id) if chat_id else {}
     last_folder = ctx.get("folder")
-    last_profile = ctx.get("profile")
     
-    # === QUESTION / RESULT detection ===
-    # "đã xóa hết chưa", "xong chưa", "sao rồi" → VERIFY real state, not just copy old text
-    if ("QUESTION" in concepts or "RESULT" in concepts) and len(text_lower) < 100:
-        # Detect WHAT the question is about from concepts + history
+    # 1. Pure QUESTION/RESULT only (no action verbs): "xong chưa?", "sao rồi?"
+    if ("QUESTION" in concepts or "RESULT" in concepts) and not action_concepts and len(text_lower) < 50:
+        folder_match = re.search(r'fb\s*(\d+)', text_lower)
+        verify_folder = f"fb{folder_match.group(1)}" if folder_match else last_folder
+        verify_profile = None
+        pm = re.search(r'\b[sS]\s*(\d+)\b', text_lower)
+        if pm:
+            verify_profile = f"S{pm.group(1)}"
+        elif ctx.get("profile"):
+            verify_profile = ctx["profile"]
+        
         question_topic = None
-        if "REMOVE" in concepts or ctx.get("action") in ("xóa", "delete_die", "delete_all"):
+        if ctx.get("action") in ("xóa", "delete_die", "delete_all"):
             question_topic = "delete"
-        elif "CHECK" in concepts or ctx.get("action") in ("batch_check", "check"):
+        elif ctx.get("action") in ("batch_check", "check"):
             question_topic = "check"
-        elif "COUNT" in concepts or ctx.get("action") == "list":
+        elif ctx.get("action") == "list":
             question_topic = "count"
-        
-        # Use folder from question text first, then from context
-        verify_folder = folder_id or last_folder
-        verify_profile = profile or last_profile
-        
-        # Detect compound request: "xóa hết chưa? chưa thì xóa đi"
-        # Only auto-execute when there's a clear conditional pattern
-        auto_action = None
-        if "REMOVE" in concepts:
-            # Check for conditional patterns: "chưa thì xóa", "nếu chưa thì", "k thì xóa"
-            conditional = bool(re.search(r'chưa\s*thì|nếu\s*chưa|không\s*thì|chưa\s*(?:thì\s*)?xóa|k\s*thì', text_lower))
-            no_check = bool(re.search(r'k\s*cần\s*check|không\s*cần\s*check|không\s*check|k\s*check|khỏi\s*check', text_lower))
-            if conditional or no_check:
-                if "ALL" in concepts and "DIE" not in concepts:
-                    auto_action = "delete_all"
-                elif no_check:
-                    auto_action = "delete_all"  # "k cần check" = delete all, not just die
-                elif "DIE" in concepts:
-                    auto_action = "delete_die"
-                elif conditional:
-                    # "chưa thì xóa đi" without specifying die → delete all
-                    auto_action = "delete_all"
         
         return {"action": "verify_status", "params": {
             "topic": question_topic,
@@ -2084,90 +2134,28 @@ def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
             "profile": verify_profile,
             "original_question": text_lower,
             "last_result": ctx.get("last_result", ""),
-            "auto_action": auto_action,
         }, "reply": "🔍 Đang kiểm tra..."}
     
-    # Pure follow-up: only CONFIRM/RETRY concepts, nothing else substantive
-    action_concepts = concepts - {"CONFIRM", "RETRY", "RESULT", "QUESTION", "ALL", "KEEP", "LIVE"}
-    
-    if len(text_lower) < 40 and not action_concepts:
-        # "ok", "làm đi", "tiếp", "chạy luôn"
-        if "CONFIRM" in concepts:
-            if last_folder:
-                ctx_action = ctx.get("action")
-                # Respect the context: if last action was delete_all, confirm with delete_all
-                if ctx_action == "delete_all":
-                    return {"action": "delete_all_profiles", "params": {"folder_id": last_folder},
-                            "reply": f"✅ OK, đang xóa hết {last_folder}..."}
-                else:
-                    return {"action": "delete_die_profiles", "params": {"folder_id": last_folder, "concurrency": 10},
-                            "reply": f"✅ OK, đang xóa die {last_folder}..."}
-            return None
-        
-        # "làm lại", "thử lại", "check lại"
-        if "RETRY" in concepts:
-            if last_folder:
-                return {"action": "delete_die_all", "params": {"concurrency": 10}, "reply": "🔄 Chạy lại..."}
-            return None
-    
-    # Short "xóa/remove" without explicit target → from context
-    if len(text_lower) < 30 and "REMOVE" in concepts and not folder_id and not profile:
+    # 2. Pure CONFIRM (< 15 chars, no action): "ok", "ừ", "làm đi"
+    if "CONFIRM" in concepts and len(text_lower) < 15 and not action_concepts:
         if last_folder:
-            return {"action": "delete_die_profiles", "params": {"folder_id": last_folder, "concurrency": 10},
-                    "reply": f"🗑️ Xóa die {last_folder}..."}
-        return {"action": "delete_die_all", "params": {"concurrency": 10}, "reply": "🗑️ Xóa die toàn bộ..."}
+            ctx_action = ctx.get("action")
+            if ctx_action == "delete_all":
+                return {"action": "delete_all_profiles", "params": {"folder_id": last_folder},
+                        "reply": f"✅ OK, đang xóa hết {last_folder}..."}
+            else:
+                return {"action": "delete_die_profiles", "params": {"folder_id": last_folder, "concurrency": 10},
+                        "reply": f"✅ OK, đang xóa die {last_folder}..."}
+        return None  # No context → AI handles
     
-    # ===== AGENT PRIORITY: If profile + specific agent targets → agent_execute =====
-    # These override generic "check/xem" intents
-    if profile and concepts & AGENT_CONCEPTS:
-        task = re.sub(r'\b[sS]\s*\d+\b', '', raw).strip()
-        task = re.sub(r'\b[aA]\s*\d+\b', '', task).strip()
-        if task:
-            return {"action": "agent_execute", "params": {"profile": profile, "task": task},
-                    "reply": f"🤖 Agent đang thực hiện cho {profile}..."}
+    # 3. Pure RETRY (< 20 chars): "làm lại", "thử lại"
+    if "RETRY" in concepts and len(text_lower) < 20 and not action_concepts:
+        if last_folder:
+            return {"action": "delete_die_all", "params": {"concurrency": 10}, "reply": "🔄 Chạy lại..."}
+        return None
     
-    # ===== SCORE ALL INTENTS =====
-    scores = {}
-    for intent, rule in INTENT_RULES.items():
-        # Check entity constraints
-        if rule.get("needs_profile") and not profile:
-            continue
-        if rule.get("needs_folder") and not folder_id:
-            continue
-        if rule.get("needs_no_profile") and profile:
-            continue
-        if rule.get("needs_no_folder") and folder_id:
-            # Special: delete_die_all needs no folder, but if folder → use delete_die_profiles
-            continue
-        if rule.get("needs_no"):
-            if concepts & rule["needs_no"]:
-                continue
-        
-        best_score = 0
-        for required, optional, base in rule["formulas"]:
-            if required.issubset(concepts):
-                score = base + len(concepts & optional) * 2
-                best_score = max(best_score, score)
-        
-        if best_score > 0:
-            scores[intent] = best_score
-    
-    if not scores:
-        # Check agent catch-all
-        if profile and concepts & AGENT_CONCEPTS:
-            task = re.sub(r'\b[sS]\s*\d+\b', '', raw).strip()
-            task = re.sub(r'\b[aA]\s*\d+\b', '', task).strip()
-            if task:
-                return {"action": "agent_execute", "params": {"profile": profile, "task": task},
-                        "reply": f"🤖 Agent đang thực hiện cho {profile}..."}
-        return None  # Let AI handle
-    
-    # Pick highest score
-    best_intent = max(scores, key=scores.get)
-    logger.info(f"Intent scores: {scores} → winner: {best_intent} (score={scores[best_intent]})")
-    
-    # ===== BUILD RESPONSE =====
-    return _build_action(best_intent, concepts, profile, folder_id, concurrency, text_lower, raw)
+    # EVERYTHING ELSE → AI brain handles
+    return None
 
 
 def _build_action(intent: str, concepts: set, profile: str, folder_id: str,
