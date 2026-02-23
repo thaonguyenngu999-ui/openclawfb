@@ -1,103 +1,129 @@
-# FB Manager Pro - CYBERPUNK 2077 Edition
+# OpenClaw FB Manager Pro
 
-![Version](https://img.shields.io/badge/version-2.0.77-cyan)
-![Python](https://img.shields.io/badge/python-3.9+-blue)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-green)
+Hệ thống quản lý & tự động hóa Facebook đa tài khoản với AI Agent, Telegram Bot và giao diện Desktop.
 
-> 🎮 **Phần mềm quản lý Facebook tích hợp Hidemium Browser với giao diện Cyberpunk 2077**
+## Tính năng
 
-## ✨ Tính năng
+- **Quản lý đa tài khoản** — Mở, quản lý nhiều profile Hidemium cùng lúc
+- **AI Agent** — Agent tự động điều khiển trình duyệt thực hiện task bất kỳ (đăng bài, tương tác, duyệt feed...)
+- **Telegram Bot** — Điều khiển từ xa qua Telegram (chat AI, ra lệnh agent, nuôi nick...)
+- **Nuôi nick tự động** — Duyệt feed, like, comment tự động với AI sinh nội dung
+- **Đăng bài hàng loạt** — Đăng bài lên nhiều tài khoản, page, group
+- **Giao diện Desktop** — PySide6 UI với live monitoring
 
-### 👤 Profiles Management
-- Quản lý profiles từ Hidemium Browser
-- Start/Stop browser
-- Sync từ Hidemium API
+## Yêu cầu
 
-### 🔐 Login Facebook
-- Đăng nhập bằng Cookie
-- Đăng nhập bằng Email/Password
-- Hỗ trợ 2FA
+- **Python** >= 3.9
+- **Hidemium Browser** đang chạy trên port `2222`
+- **Windows** 10/11
 
-### 📄 Pages Management
-- Scan pages từ tài khoản
-- Tạo page mới
-- Quản lý danh sách pages
+## Cài đặt
 
-### 🎬 Reels Upload
-- Upload Reels lên Pages
-- Lên lịch đăng
-- Quản lý caption & hashtags
-
-### ✏️ Content Management
-- Soạn nội dung mẫu
-- Template với biến động
-- Quản lý hashtags
-
-### 👥 Groups Posting
-- Đăng bài vào nhiều nhóm
-- Delay ngẫu nhiên
-- Lên lịch đăng
-
-### 📜 Automation Scripts
-- Tạo kịch bản tự động
-- Chạy theo lịch
-- Monitoring
-
-### 📊 Posts Tracking
-- Theo dõi lịch sử đăng
-- Thống kê thành công/thất bại
-- Export báo cáo
-
-## 🚀 Cài đặt
-
-### Yêu cầu
-- Python 3.9+
-- Hidemium Browser
-
-### Bước 1: Clone repository
 ```bash
-git clone https://github.com/your-repo/fb-manager-pro.git
-cd fb-manager-pro
-```
+# Clone repo
+git clone https://github.com/thaonguyenngu999-ui/openclawfb.git
+cd openclawfb
 
-### Bước 2: Cài dependencies
-```bash
+# Tạo virtual environment
+python -m venv .venv
+.venv\Scripts\activate
+
+# Cài dependencies
 pip install -r requirements.txt
 ```
 
-### Bước 3: Chạy ứng dụng
+## Cấu hình
+
+Sửa các API key trong file tương ứng:
+
+| Key | File | Mô tả |
+|-----|------|--------|
+| `HIDEMIUM_TOKEN` | `config.py` | API key Hidemium (lấy từ app Hidemium) |
+| `TELEGRAM_BOT_TOKEN` | `telegram_bot.py` | Token bot Telegram (tạo qua @BotFather) |
+| `POLLINATIONS_KEY` | `telegram_bot.py` | API key Pollinations.ai |
+
+## Chạy
+
+### Giao diện Desktop
+
 ```bash
 python main.py
 ```
 
-## 🎨 Theme Colors
+### API Server + Telegram Bot (headless)
 
-| Color | Hex | Usage |
-|-------|-----|-------|
-| Neon Cyan | `#00f0ff` | Primary accent |
-| Neon Magenta | `#ff00a8` | Secondary accent |
-| Neon Green | `#00ff66` | Success states |
-| Neon Yellow | `#fcee0a` | Warnings |
-| Neon Purple | `#bf00ff` | Special elements |
-| Neon Orange | `#ff6b00` | Groups tab |
-| Neon Red | `#ff003c` | Errors, danger |
+```bash
+# Terminal 1 — API Server (port 8899)
+python openclaw_api.py
 
-## ⚙️ Cấu hình Hidemium
-
-Mặc định kết nối tới: `http://127.0.0.1:52000`
-
-Thay đổi trong `config.py`:
-```python
-API_CONFIG = {
-    "hidemium_base_url": "http://127.0.0.1:52000",
-    "timeout": 30,
-}
+# Terminal 2 — Telegram Bot
+python telegram_bot.py
 ```
 
-## 📝 License
+## Telegram Bot
 
-MIT License
+| Lệnh | Ví dụ | Mô tả |
+|-------|-------|--------|
+| `s{id} {task}` | `s09 vào trang cá nhân viết bài về tết` | Agent thực hiện task trên profile |
+| `nuôi nick` | `nuôi 5 nick` | Nuôi nick hàng loạt |
+| `list` | `list` | Xem danh sách profile |
+| Chat tự do | `hôm nay thời tiết thế nào?` | Chat AI |
 
----
+## API Endpoints (port 8899)
 
-**Made with 💜 in Vietnam | CYBERPUNK 2077 Style**
+| Method | Endpoint | Mô tả |
+|--------|----------|--------|
+| GET | `/status` | Trạng thái server |
+| POST | `/open_browser` | Mở browser profile |
+| POST | `/close` | Đóng browser |
+| POST | `/screenshot` | Chụp màn hình |
+| POST | `/agent_execute` | Chạy AI agent |
+| POST | `/like` | Like bài viết |
+| POST | `/fb_comment` | Comment bài |
+| POST | `/fb_read_feed` | Đọc feed |
+| POST | `/fb_nurture_batch` | Nuôi nick hàng loạt |
+| POST | `/list_profiles` | Danh sách profile |
+
+## Cấu trúc
+
+```
+├── main.py                 # GUI Desktop (PySide6)
+├── openclaw_api.py         # HTTP API Server
+├── telegram_bot.py         # Telegram Bot
+├── config.py               # Cấu hình Hidemium
+├── db.py / database.py     # Database
+│
+├── skills/                 # Business logic
+│   ├── base_skill.py       # CDP, JS, screenshot, AI
+│   ├── browser_skill.py    # Mở/đóng browser
+│   ├── login_skill.py      # Đăng nhập Facebook
+│   ├── feed_skill.py       # Like, comment, feed, nuôi nick
+│   ├── groups_skill.py     # Quản lý group
+│   ├── reels_skill.py      # Xem reels
+│   ├── agent_skill.py      # AI Agent (compose_post, navigate, click...)
+│   ├── vision_skill.py     # Vision click
+│   └── telegram_mixin.py   # Telegram helpers
+│
+├── tabs/                   # GUI tabs
+│   ├── interaction_page.py # Nuôi nick + live monitoring
+│   ├── login_page.py       # Đăng nhập
+│   ├── posts_page.py       # Đăng bài
+│   ├── groups_page.py      # Groups
+│   ├── pages_page.py       # Pages
+│   ├── reels_page.py       # Reels
+│   ├── content_page.py     # Nội dung
+│   └── scripts_page.py     # Scripts
+│
+├── widgets/                # UI components
+├── automation/             # CDP client & window manager
+└── data/                   # JSON data & SQLite DB
+```
+
+## Tech Stack
+
+- **UI**: PySide6
+- **Browser**: CDP (Chrome DevTools Protocol) via WebSocket
+- **AI**: Pollinations.ai (gemini-fast)
+- **Antidetect**: Hidemium Browser
+- **Bot**: python-telegram-bot
+- **Server**: Python ThreadingHTTPServer
