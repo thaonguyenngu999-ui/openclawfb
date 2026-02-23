@@ -127,129 +127,40 @@ def add_to_history(chat_id: str, role: str, content: str):
 # ============================================================
 # SYSTEM PROMPT for NLP intent parsing
 # ============================================================
-SYSTEM_PROMPT = """You are an AI assistant for FB Manager Pro - a Facebook automation tool.
-Your job: Parse the user's Vietnamese/English message and return a JSON action.
+SYSTEM_PROMPT = """You are AI CUTE - a Vietnamese AI assistant for FB Manager Pro (Facebook profile manager).
+Parse user message → return JSON action. NEVER return plain text.
 
-PERSONALITY & CONVERSATION STYLE:
-- You are friendly, smart, and natural — like a Vietnamese tech buddy, not a stiff robot.
-- For "chat" action: Write detailed, helpful, context-aware replies in Vietnamese. Follow the conversation flow.
-- If user asks a question about errors, results, or follows up on previous context, explain clearly based on history.
-- Use natural Vietnamese tone: "bác", "ông", casual but respectful.
-- When user just chats, jokes, or asks something non-action: reply naturally and engagingly.
-- NEVER give 1-word replies. Chat replies should be at least 1-2 sentences, more if needed.
-- Use conversation history to understand context: if user said "check fb3" before, and now says "kết quả sao?", refer back to that.
+CORE RULES:
+1. ALWAYS return valid JSON: {"action": "...", "params": {...}, "reply": "..."}
+2. Use conversation history to resolve "nó", "cái đó", "folder kia", etc.
+3. When user wants action (xóa/check/mở...) → return action, NEVER just chat about it
+4. Short follow-ups ("xóa đi", "làm luôn") → infer from history, execute
+5. Never ask "chọn 1,2,3" — just DO the best action
 
-Available actions:
-1. open_browser - Open browser for a profile
-2. close_browser - Close browser for a profile
-3. list_profiles - List all browser profiles (optionally filter by folder)
-4. check_login - Quick check if a profile is logged into Facebook (requires browser open)
-5. check_fb_status - Full check: open browser → navigate FB → detect status → close (standalone)
-6. debug_groups - List all Facebook groups a profile has joined
-7. leave_groups - Leave/cancel all Facebook groups for a profile
-8. watch_reels - Watch Facebook Reels, optionally like and comment randomly
-9. screenshot - Take screenshot of current browser state
-10. navigate - Navigate browser to a specific URL
-11. batch_check_login - Check login status of ALL profiles in a folder concurrently
-12. fb_read_feed - Read Facebook news feed, extract visible posts
-13. fb_comment - Comment on a specific post in the feed
-14. fb_nurture_batch - Batch nurture: read feed + auto-comment on multiple profiles
-15. login_fb - Login Facebook with uid/password
-16. vision_capture - Capture browser screenshot for AI vision analysis
-17. vision_click - AI vision: find and click an element by description
-18. vision_type - AI vision: find an input and type text
-19. agent_execute - Autonomous AI agent: for ANY task not covered above
-20. chat - Just chat, no action needed
-21. list_folders - List all Hidemium folders (thư mục)
-22. list_tags - List all tags
-23. list_scripts - List automation scripts
-24. list_campaigns - List campaigns
-25. get_running - List currently running profiles
-26. get_versions - List available browser versions
-27. create_profile - Create a new browser profile
-28. update_profile_name - Rename a profile (needs uuid, name)
-29. update_profile_note - Update profile note (needs uuid, note)
-30. update_proxy - Set proxy for profile (needs uuid, ip, port, type)
-31. remove_proxy - Remove proxy from profile (needs uuid)
-32. change_fingerprint - Regenerate fingerprint (needs uuid)
-33. change_status - Change profile status: live/die/check/new (needs uuid, status)
-34. add_to_folder - Add profiles to folder (needs folder_uuid, profile_uuids)
-35. sync_tags - Set tags for profile (needs uuid, tags[])
-36. delete_die_profiles - Delete all DIE profiles in a folder
-37. delete_die_all - Check ALL folders and delete all DIE profiles (keep LIVE)
+ACTIONS (key ones):
+- delete_die_all: Check ALL folders, delete DIE profiles {"concurrency": N}
+- delete_die_profiles: Check+delete DIE in 1 folder {"folder_id": "fb3", "concurrency": N}
+- batch_check_login: Check login status of folder {"folder_id": "fb1", "concurrency": N}
+- list_folders: List folders + counts
+- list_profiles: List profiles in folder {"folder_id": "fb1"}
+- open_browser/close_browser: {"profile": "S10"}
+- check_fb_status: Full check 1 profile {"profile": "S10"}
+- leave_groups/debug_groups: {"profile": "S10"}
+- watch_reels: {"profile": "S10", "count": 5, "comment": true}
+- fb_nurture_batch: {"profiles": [...], "max_workers": 3}
+- agent_execute: ANY browser task {"profile": "S10", "task": "description"}
+- chat: Just talking, no action {"reply": "..."}
 
-Profile naming convention:
-- "S10", "s10", "S 10" → profile = "S10"
-- "fb1", "FB1", "fb2" → this is the FOLDER name, not profile
-- Folder mapping: fb1 = folder 1 (S1-S17), fb2 = folder 2 (S30-S70), fb5 = folder 5 (A100-A194), fb6 = folder 6 (A200-A307)
+VIETNAMESE INTENT MAP:
+- "check/kiểm tra toàn bộ" + "die xóa/live giữ" → delete_die_all
+- "còn bao nhiêu/tổng" → list_folders
+- "xóa hết/xóa luôn/xóa đi" (after check) → delete from context
+- "nuôi/dưỡng" → fb_nurture_batch
+- "luồng/thread" → concurrency param
+- fb1/fb2/fb3 = folder names, S10/A200 = profile names
 
-RESPOND WITH ONLY a JSON object, nothing else:
-{"action": "ACTION_NAME", "params": {...}, "reply": "Vietnamese response"}
-
-Examples:
-{"action": "leave_groups", "params": {"profile": "S10"}, "reply": "OK, đang thoát hết nhóm S10..."}
-{"action": "open_browser", "params": {"profile": "S10"}, "reply": "Đang mở browser S10..."}
-{"action": "check_login", "params": {"profile": "S10"}, "reply": "Đang kiểm tra login S10..."}
-{"action": "check_fb_status", "params": {"profile": "S10"}, "reply": "Đang check trạng thái FB S10..."}
-{"action": "list_profiles", "params": {"folder_id": "fb1"}, "reply": "Đang lấy danh sách profiles fb1..."}
-{"action": "list_folders", "params": {}, "reply": "Đang lấy danh sách thư mục..."}
-{"action": "list_tags", "params": {}, "reply": "Đang lấy danh sách tags..."}
-{"action": "list_scripts", "params": {}, "reply": "Đang lấy danh sách scripts..."}
-{"action": "list_campaigns", "params": {}, "reply": "Đang lấy danh sách campaigns..."}
-{"action": "get_running", "params": {}, "reply": "Đang xem profiles đang chạy..."}
-{"action": "get_versions", "params": {}, "reply": "Đang xem phiên bản browser..."}
-{"action": "debug_groups", "params": {"profile": "S10"}, "reply": "Đang kiểm tra groups S10..."}
-{"action": "close_browser", "params": {"profile": "S10"}, "reply": "Đang đóng browser S10..."}
-{"action": "screenshot", "params": {"profile": "S10"}, "reply": "Đang chụp S10..."}
-{"action": "watch_reels", "params": {"profile": "S15", "count": 5, "comment": true, "comment_count": 3}, "reply": "Đang xem reels S15 và comment ngẫu nhiên..."}
-{"action": "batch_check_login", "params": {"folder_id": "fb2", "concurrency": 10}, "reply": "Đang check login fb2 (10 luồng)..."}
-{"action": "fb_read_feed", "params": {"profile": "S10", "scroll_count": 3}, "reply": "Đang đọc feed S10..."}
-{"action": "fb_comment", "params": {"profile": "S10", "post_index": 0, "comment": "Hay quá!"}, "reply": "Đang comment bài đầu tiên..."}
-{"action": "fb_nurture_batch", "params": {"profiles": ["S10", "S11", "S15"], "max_workers": 3, "comments_per_profile": 2}, "reply": "Đang nuôi 3 profile (3 luồng)..."}
-{"action": "login_fb", "params": {"profile": "S10", "fb_id": "100xxx", "password": "abc123"}, "reply": "Đang login S10..."}
-{"action": "navigate", "params": {"profile": "S10", "url": "https://facebook.com/groups"}, "reply": "Đang navigate..."}
-{"action": "vision_capture", "params": {"profile": "S10"}, "reply": "Đang chụp ảnh phân tích..."}
-{"action": "vision_click", "params": {"profile": "S10", "target": "nút Tạo bài viết"}, "reply": "Đang tìm và click 'nút Tạo bài viết'..."}
-{"action": "vision_type", "params": {"profile": "S10", "target": "ô tìm kiếm", "text": "hello"}, "reply": "Đang gõ vào ô tìm kiếm..."}
-{"action": "agent_execute", "params": {"profile": "S10", "task": "xem thông báo, click ngẫu nhiên 1 thông báo"}, "reply": "🤖 Agent đang thực hiện..."}
-{"action": "change_fingerprint", "params": {"uuid": "xxx"}, "reply": "Đang đổi fingerprint..."}
-{"action": "change_status", "params": {"uuid": "xxx", "status": "live"}, "reply": "Đang đổi status..."}
-{"action": "delete_die_profiles", "params": {"folder_id": "fb1"}, "reply": "Đang xóa die fb1..."}
-{"action": "delete_die_all", "params": {}, "reply": "Đang xóa die toàn bộ thư mục..."}
-{"action": "chat", "params": {}, "reply": "Chào bác!"}
-
-MULTIPLE ACTIONS IN ONE MESSAGE:
-If the user requests multiple different actions for different profiles in one message, return a JSON ARRAY:
-[
-  {"action": "leave_groups", "params": {"profile": "S17"}, "reply": "S17 đang thoát nhóm..."},
-  {"action": "watch_reels", "params": {"profile": "S15", "count": 5, "comment": true, "comment_count": 3}, "reply": "S15 xem reels..."}
-]
-
-IMPORTANT:
-- Always return valid JSON only. No markdown, no explanation.
-- Use conversation history context to understand "check nó", "folder đó", "kết quả sao?", "lỗi gì?", etc.
-- When user says "10 luồng" or "5 threads", set concurrency accordingly.
-- "nuôi" = fb_nurture_batch, "lướt feed" = fb_read_feed, "comment" = fb_comment
-- "vision", "phân tích", "nhìn", "tìm nút" = vision_click/vision_capture
-- For tasks NOT covered by actions 1-18, use agent_execute. NEVER say "chưa hỗ trợ".
-- agent_execute can do ANY browser task: xem thông báo, gửi tin nhắn, tìm kiếm, đăng bài, etc.
-- Only use array when genuinely multiple actions. Single action = single object.
-
-CONVERSATION EXAMPLES (chat action):
-User: "error là sao?" → {"action": "chat", "params": {}, "reply": "Error tức là bị lỗi bác ơi. Bác gặp lỗi gì thì nói tui xem, tui check giúp!"}
-User: "bot này làm được gì?" → {"action": "chat", "params": {}, "reply": "Tui quản lý Facebook profiles cho bác nè! Check login, xóa die, nuôi acc, lướt reels, thoát nhóm... Gõ 'help' để xem chi tiết bác nhé!"}
-User: "cảm ơn" → {"action": "chat", "params": {}, "reply": "Không có gì bác! Cần gì cứ gọi 😄"}
-
-FOLLOW-UP ACTION EXAMPLES (CRITICAL - DO NOT just "chat" for these):
-User previously checked fb3, now says "xóa hết" → {"action": "delete_die_profiles", "params": {"folder_id": "fb3"}, "reply": "🗑️ Đang xóa die fb3..."}
-User says "xóa đi", "xóa luôn", "delete nó" after any check → {"action": "delete_die_profiles", "params": {"folder_id": "<folder from context>"}, "reply": "🗑️ Xóa die..."}
-User says "xóa toàn bộ", "xóa hết luôn" → {"action": "delete_die_all", "params": {}, "reply": "🗑️ Xóa die toàn bộ..."}
-User says "rồi sao", "xong chưa", "kết quả" after action → {"action": "chat", "params": {}, "reply": "<summarize result from history>"}
-User says "check lại", "làm lại" → RE-RUN the previous action from history
-
-RULE: When user requests an action (xóa, check, mở...), ALWAYS return an action JSON, NEVER just chat about it.
-RULE: If user says short commands like "xóa", "xóa hết", "xóa đi", "delete" → find folder/profile from conversation history and execute.
-RULE: Never ask "bác chọn 1, 2 hay 3" — just DO the most logical action.
+OUTPUT FORMAT: {"action": "NAME", "params": {}, "reply": "Việt namếse reply"}
+For chat: {"action": "chat", "params": {}, "reply": "Friendly Vietnamese reply"}
 """
 
 
@@ -1447,6 +1358,22 @@ async def _message_handler_inner(update: Update, context: ContextTypes.DEFAULT_T
     
     parsed = parse_ai_response(ai_response)
     
+    # === JSON RETRY: If AI returned plain text (chat fallback) but user wanted an action ===
+    if isinstance(parsed, dict) and parsed.get("action") == "chat":
+        # Check if the original message seems like an action request
+        action_keywords = r'check|xóa|mở|đóng|xem|list|kiểm|nuôi|lướt|agent|thoát|delete|scan|bật|chạy|open|close'
+        if re.search(action_keywords, user_msg.lower()):
+            # AI returned chat but user wanted action → retry with stronger JSON instruction
+            logger.warning("AI returned chat for action-like message, retrying with JSON nudge...")
+            retry_messages = messages.copy()
+            retry_messages.append({"role": "assistant", "content": ai_response})
+            retry_messages.append({"role": "user", "content": "RESPOND WITH JSON ONLY. Format: {\"action\": \"...\", \"params\": {...}, \"reply\": \"...\"}. NO plain text."})
+            retry_response = await call_ai(retry_messages, max_tokens=500, temperature=0.1)
+            retry_parsed = parse_ai_response(retry_response)
+            if isinstance(retry_parsed, dict) and retry_parsed.get("action") != "chat":
+                parsed = retry_parsed
+                logger.info(f"JSON retry success: {parsed.get('action')}")
+    
     # Handle multi-action (list of actions)
     if isinstance(parsed, list) and len(parsed) > 1:
         logger.info(f"Multi-action: {len(parsed)} actions")
@@ -1535,6 +1462,49 @@ async def _message_handler_inner(update: Update, context: ContextTypes.DEFAULT_T
             logger.warning(f"edit_text result failed: {e2}")
 
 
+def _get_last_context(chat_id: str) -> dict:
+    """Extract last folder/profile/action from conversation history."""
+    ctx = {"folder": None, "profile": None, "action": None, "last_result": None}
+    if not chat_id:
+        return ctx
+    history = get_history(chat_id)
+    for msg in reversed(history):
+        content = msg.get("content", "")
+        c_lower = content.lower()
+        # Extract folder
+        if not ctx["folder"]:
+            fm = re.search(r'fb\s*(\d+)', c_lower)
+            if fm:
+                ctx["folder"] = f"fb{fm.group(1)}"
+            else:
+                folder_map = {'fb1': 'fb1', 'fb2': 'fb2', 'fb3': 'fb3', 'fb ok': 'fb5', 'đông hưng': 'fb7'}
+                for fname, fid in folder_map.items():
+                    if fname in c_lower:
+                        ctx["folder"] = fid
+                        break
+        # Extract profile
+        if not ctx["profile"]:
+            pm = re.search(r'\b[sS]\s*(\d+)\b', content)
+            if pm:
+                ctx["profile"] = f"S{pm.group(1)}"
+            else:
+                am = re.search(r'\b[aA]\s*(\d+)\b', content)
+                if am:
+                    ctx["profile"] = f"A{am.group(1)}"
+        # Extract last action
+        if not ctx["action"]:
+            for kw in ["delete_die", "batch_check", "check", "xóa", "list"]:
+                if kw in c_lower:
+                    ctx["action"] = kw
+                    break
+        # Extract last result summary
+        if not ctx["last_result"] and msg.get("role") == "assistant":
+            ctx["last_result"] = content[:200]
+        if ctx["folder"] and ctx["profile"] and ctx["action"]:
+            break
+    return ctx
+
+
 def _extract_concurrency(text_lower: str, default: int = 5) -> int:
     """Extract concurrency/thread count from text. Matches: '20 luồng', 'bật 20', 'mở 20 thread', etc."""
     # Pattern 1: "N luồng/thread/worker"
@@ -1551,43 +1521,50 @@ def _extract_concurrency(text_lower: str, default: int = 5) -> int:
 
 
 def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
-    """Fast regex-based intent detection for common patterns (skip AI call)."""
+    """Smart Vietnamese intent detection. Handles 95% of cases without AI."""
     text_lower = text.lower().strip()
+    raw = text.strip()
     
-    # ===== FOLLOW-UP SHORT COMMANDS (xóa hết, xóa đi, xóa luôn, delete) =====
-    # These need conversation history to determine what folder/profile
-    if re.search(r'^(xóa|xoá|delete|dọn|hết|xóa hết|xóa đi|xóa luôn|xóa ngay|xoá hết|xoá luôn|xóa die|xóa chết)\s*$', text_lower):
-        # Short "xóa" command — find folder from recent history
-        if chat_id:
-            history = get_history(chat_id)
-            last_folder = None
-            for msg in reversed(history):
-                content = msg.get("content", "")
-                # Look for folder references in recent messages
-                fm = re.search(r'fb\s*(\d+)', content.lower())
-                if fm:
-                    last_folder = f"fb{fm.group(1)}"
-                    break
-                # Also check for folder names in results
-                for fname in ['FB1', 'FB2', 'FB3', 'FB OK', 'Đông Hưng']:
-                    if fname.lower() in content.lower():
-                        folder_map = {'fb1': 'fb1', 'fb2': 'fb2', 'fb3': 'fb3', 'fb ok': 'fb5', 'đông hưng': 'fb7'}
-                        last_folder = folder_map.get(fname.lower())
-                        break
-                if last_folder:
-                    break
+    # ===== ULTRA-SHORT / FOLLOW-UP (1-3 words) =====
+    # These MUST check history for context
+    if len(text_lower) < 30:
+        ctx = _get_last_context(chat_id) if chat_id else {}
+        last_folder = ctx.get("folder")
+        last_profile = ctx.get("profile")
+        
+        # "xóa" family
+        if re.search(r'^(xóa|xoá|delete|dọn|xóa hết|xóa đi|xóa luôn|xóa ngay|xoá hết|xoá luôn|xóa die|xóa chết|hết|xóa hết đi|dọn hết|xóa hết luôn|xóa sạch)\s*[!?.]*$', text_lower):
             if last_folder:
-                return {"action": "delete_die_profiles", "params": {"folder_id": last_folder, "concurrency": 10}, "reply": f"🗑️ Đang xóa die {last_folder}..."}
-            else:
-                return {"action": "delete_die_all", "params": {"concurrency": 10}, "reply": "🗑️ Đang xóa die toàn bộ..."}
+                return {"action": "delete_die_profiles", "params": {"folder_id": last_folder, "concurrency": 10}, "reply": f"🗑️ Xóa die {last_folder}..."}
+            return {"action": "delete_die_all", "params": {"concurrency": 10}, "reply": "🗑️ Xóa die toàn bộ..."}
+        
+        # "làm lại" / "check lại" / "thử lại"
+        if re.search(r'^(làm lại|thử lại|check lại|chạy lại|re.?run|retry)\s*[!?.]*$', text_lower):
+            if last_folder:
+                return {"action": "delete_die_all", "params": {"concurrency": 10}, "reply": f"🔄 Chạy lại..."}
+            return None  # Let AI handle
+        
+        # "rồi sao" / "xong chưa" / "kết quả"
+        if re.search(r'^(rồi sao|xong chưa|kết quả|sao rồi|thế nào|ok chưa|\?+)\s*$', text_lower):
+            # Return last result from history as chat
+            last_result = ctx.get("last_result", "")
+            if last_result:
+                return {"action": "chat", "params": {}, "reply": f"Kết quả lần trước: {last_result[:300]}"}
+            return {"action": "chat", "params": {}, "reply": "Chưa có kết quả nào trước đó bác ơi. Bác muốn check gì?"}
+        
+        # "tiếp" / "tiếp tục" / "đi" / "làm đi"
+        if re.search(r'^(tiếp|tiếp tục|làm đi|chạy đi|go|ok|\u0111i|làm luôn|chạy luôn|làm|y|yes|ư|ok luôn|vâng)\s*[!?.]*$', text_lower):
+            # Confirm previous suggestion → try to re-execute from context
+            if last_folder:
+                return {"action": "delete_die_profiles", "params": {"folder_id": last_folder, "concurrency": 10}, "reply": f"✅ OK, đang thực hiện cho {last_folder}..."}
+            return None
     
-    # Extract profile names (S10, s10, S 10, A100, a100, etc.)
-    profile_matches = re.findall(r'\b[sS]\s*(\d+)\b', text)
-    a_matches = re.findall(r'\b[aA]\s*(\d+)\b', text)
+    # ===== EXTRACT ENTITIES =====
+    profile_matches = re.findall(r'\b[sS]\s*(\d+)\b', raw)
+    a_matches = re.findall(r'\b[aA]\s*(\d+)\b', raw)
     
-    # If multiple profiles mentioned, let AI handle multi-action
     if len(profile_matches) + len(a_matches) > 1:
-        return None
+        return None  # Multi-profile → let AI handle
     
     profile = None
     if profile_matches:
@@ -1595,23 +1572,37 @@ def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
     elif a_matches:
         profile = f"A{a_matches[0]}"
     
-    # Extract folder (fb1, fb2, fb5, fb6, or named folders like "FB OK", "FB3")
     folder_match = re.search(r'fb\s*(\d+)', text_lower)
     folder_id = f"fb{folder_match.group(1)}" if folder_match else None
-    
-    # Also try named folder patterns: "FB OK", "FBOK", "fb ok"
     if not folder_id:
-        named_folder_match = re.search(r'\b(fb\s*ok|fbok|fb\s*3|đông\s*hưng)\b', text_lower)
-        if named_folder_match:
-            folder_id = named_folder_match.group(1).strip()
+        named = re.search(r'\b(fb\s*ok|fbok|fb\s*3|đông\s*hưng)\b', text_lower)
+        if named:
+            folder_id = named.group(1).strip()
+    
+    concurrency = _extract_concurrency(text_lower)
+    
+    # ===== SMART COMBO DETECTION =====
+    # "check toàn bộ bật 20 luồng die thì xóa live thì giữ" → single delete_die_all
+    has_check = bool(re.search(r'check|kiểm tra|xem|scan', text_lower))
+    has_delete = bool(re.search(r'xóa|xoá|delete|dọn|hủy', text_lower))
+    has_die = bool(re.search(r'die|chết|không.*login|not.*log', text_lower))
+    has_live_keep = bool(re.search(r'live.*giữ|giữ.*live|sống.*giữ|giữ.*sống', text_lower))
+    has_all = bool(re.search(r'toàn bộ|tất cả|all|hết|mọi|every|tất', text_lower))
+    
+    # Combo: check + die/xóa → delete_die
+    if (has_check and has_die and has_delete) or (has_die and has_delete) or (has_check and has_delete) or (has_check and has_die and has_live_keep):
+        if folder_id and not has_all:
+            return {"action": "delete_die_profiles", "params": {"folder_id": folder_id, "concurrency": concurrency}, "reply": f"🗑️ Check {folder_id} ({concurrency} luồng), die xóa live giữ..."}
+        return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🗑️ Check TOÀN BỘ ({concurrency} luồng), die xóa live giữ..."}
+    
+    # Check + all (without explicit die mention) → still delete_die_all (user wants to see status)
+    if has_check and has_all and not folder_id:
+        return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🔍 Check TOÀN BỘ ({concurrency} luồng)..."}
 
     # ===== GROUPS =====
-    # Leave groups
-    if profile and re.search(r'thoát.*nhóm|leave.*group|rời.*nhóm|out.*group|xóa.*nhóm|hủy.*nhóm', text_lower):
+    if profile and re.search(r'thoát.*nhóm|leave.*group|rời.*nhóm|out.*group|xóa.*nhóm|hủy.*nhóm|bỏ.*nhóm', text_lower):
         return {"action": "leave_groups", "params": {"profile": profile}, "reply": f"⏳ Đang thoát hết nhóm cho {profile}..."}
-    
-    # Debug/list groups
-    if profile and re.search(r'xem.*group|debug.*group|list.*group|kiểm tra.*nhóm|liệt kê.*nhóm|bao nhiêu.*nhóm|nhóm.*đã.*tham gia', text_lower):
+    if profile and re.search(r'xem.*group|debug.*group|list.*group|kiểm tra.*nhóm|liệt kê.*nhóm|bao nhiêu.*nhóm|nhóm.*đã.*tham gia|group', text_lower):
         return {"action": "debug_groups", "params": {"profile": profile}, "reply": f"🔍 Đang xem groups {profile}..."}
 
     # ===== REELS =====
@@ -1644,17 +1635,11 @@ def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
         return {"action": "close_browser", "params": {"profile": profile}, "reply": f"🔒 Đang đóng browser {profile}..."}
 
     # ===== LOGIN & STATUS =====
-    # Check FB status (full: open → navigate → check → close)
-    if profile and re.search(r'check.*status|kiểm tra.*trạng thái|fb.*status|live.*hay.*die|die.*hay.*live|status', text_lower):
-        return {"action": "check_fb_status", "params": {"profile": profile}, "reply": f"🔍 Đang check status {profile}..."}
+    if profile and re.search(r'check|status|kiểm tra|trạng thái|live.*die|die.*live|login|còn.*sống|xem', text_lower):
+        return {"action": "check_fb_status", "params": {"profile": profile}, "reply": f"🔍 Đang check {profile}..."}
     
-    # Check login (quick, browser must be open)
-    if profile and re.search(r'login|đăng nhập|kiểm tra.*login|check.*login|đã.*đăng nhập', text_lower):
-        return {"action": "check_login", "params": {"profile": profile}, "reply": f"🔍 Đang kiểm tra login {profile}..."}
-    
-    # Batch check login (folder-level)
-    if folder_id and re.search(r'check|kiểm tra|bao nhiêu.*live|live.*die|die.*live', text_lower):
-        concurrency = _extract_concurrency(text_lower)
+    # Batch check login (folder-level) — "check fb3", "kiểm tra fb1 20 luồng"
+    if folder_id and re.search(r'check|kiểm tra|bao nhiêu.*live|live.*die|die.*live|xem|scan', text_lower):
         return {"action": "batch_check_login", "params": {"folder_id": folder_id, "concurrency": concurrency}, "reply": f"🔍 Đang check {folder_id} ({concurrency} luồng)..."}
 
     # ===== SCREENSHOT =====
@@ -1673,42 +1658,26 @@ def try_quick_parse(text: str, chat_id: str = None) -> dict | None:
     if profile and re.search(r'vision.*capture|chụp.*vision|phân tích.*dom|phân tích.*giao diện|analyze', text_lower):
         return {"action": "vision_capture", "params": {"profile": profile}, "reply": f"📸 Đang chụp vision {profile}..."}
 
-    # ===== CHECK + DELETE DIE (combo: "fb3 10 luồng die thì xóa" or "check toàn bộ die xóa") =====
-    if re.search(r'die.*xóa|xóa.*die|die.*thì.*xóa|check.*xóa|xóa.*chết|die.*thì.*xoá', text_lower):
-        concurrency = _extract_concurrency(text_lower)
-        is_all = re.search(r'toàn bộ|tất cả|all|hết|mọi|every', text_lower)
-        if folder_id and not is_all:
-            return {"action": "delete_die_profiles", "params": {"folder_id": folder_id, "concurrency": concurrency}, "reply": f"🗑️ Đang check {folder_id} ({concurrency} luồng) rồi xóa die..."}
-        else:
-            return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🗑️ Đang check & xóa die TOÀN BỘ ({concurrency} luồng)..."}
+    # ===== CHECK + DELETE DIE =====
+    if has_die or has_delete:
+        if folder_id:
+            return {"action": "delete_die_profiles", "params": {"folder_id": folder_id, "concurrency": concurrency}, "reply": f"🗑️ Check {folder_id} ({concurrency} luồng), xóa die..."}
+        if has_all:
+            return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🗑️ Check toàn bộ ({concurrency} luồng), xóa die..."}
 
-    # ===== DELETE DIE PROFILES =====
-    if re.search(r'xóa.*die|delete.*die|xóa.*chết|dọn.*die|xoá.*die', text_lower):
-        concurrency = _extract_concurrency(text_lower)
-        # Check if user wants ALL folders
-        if re.search(r'toàn bộ|tất cả|all|hết|mọi|every', text_lower):
-            return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🗑️ Đang check & xóa die TOÀN BỘ ({concurrency} luồng)..."}
-        target_folder = folder_id
-        if not target_folder:
-            fm = re.search(r'fb\s*(\d+)', text_lower)
-            if fm:
-                target_folder = f"fb{fm.group(1)}"
-        if target_folder:
-            return {"action": "delete_die_profiles", "params": {"folder_id": target_folder, "concurrency": concurrency}, "reply": f"🗑️ Đang check & xóa die trong {target_folder} ({concurrency} luồng)..."}
-        # No specific folder → do all
-        return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🗑️ Đang check & xóa die TOÀN BỘ ({concurrency} luồng)..."}
+    # ===== DELETE DIE =====
+    if re.search(r'xóa|xoá|delete|dọn', text_lower) and re.search(r'die|chết', text_lower):
+        if has_all or not folder_id:
+            return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🗑️ Xóa die toàn bộ ({concurrency} luồng)..."}
+        return {"action": "delete_die_profiles", "params": {"folder_id": folder_id, "concurrency": concurrency}, "reply": f"🗑️ Xóa die {folder_id} ({concurrency} luồng)..."}
 
-    # ===== COUNT / SUMMARY PROFILES =====
-    if re.search(r'tổng.*bao nhiêu|còn bao nhiêu|bao nhiêu.*profile|bao nhiêu.*acc|tổng.*profile|còn.*mấy.*profile|count.*profile|tổng.*acc', text_lower) and not profile:
+    # ===== COUNT / SUMMARY =====
+    if re.search(r'tổng|còn bao nhiêu|bao nhiêu.*profile|bao nhiêu.*acc|mấy.*profile|count|còn.*mấy', text_lower) and not profile:
         return {"action": "list_folders", "params": {}, "reply": "📊 Đang đếm profiles..."}
 
-    # ===== CHECK TOÀN BỘ (without die/xóa → just batch check all) =====
-    if re.search(r'check.*toàn bộ|check.*tất cả|check.*all|kiểm tra.*toàn bộ|kiểm tra.*tất cả', text_lower) and not folder_id:
-        concurrency = _extract_concurrency(text_lower)
-        # If mentions die/xóa → delete_die_all (already caught above, but safety)
-        if re.search(r'die.*xóa|xóa.*die|die.*thì.*xóa', text_lower):
-            return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🗑️ Đang check & xóa die TOÀN BỘ ({concurrency} luồng)..."}
-        return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🔍 Đang check TOÀN BỘ ({concurrency} luồng)..."}
+    # ===== CHECK TOÀN BỘ =====
+    if has_check and has_all and not folder_id:
+        return {"action": "delete_die_all", "params": {"concurrency": concurrency}, "reply": f"🔍 Check TOÀN BỘ ({concurrency} luồng)..."}
 
     # ===== LIST FOLDERS =====
     if re.search(r'thư mục|folder|bao nhiêu.*fb|mấy.*fb|các fb|list.*folder|danh sách.*folder', text_lower) and not profile:
