@@ -48,3 +48,9 @@ Thumbs.db
 # Build
 *.exe
 *.spec
+
+# Project specific
+screenshots/
+codethamkhao/
+managefb-main.zip
+*.zip

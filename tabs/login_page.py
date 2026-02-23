@@ -91,7 +91,7 @@ class LoginPage(QWidget):
         top_bar = QHBoxLayout()
         top_bar.setSpacing(12)
 
-        title = CyberTitle("Đăng nhập FB", "Đăng nhập Facebook tự động", "mint")
+        title = CyberTitle("ĐĂNG NHẬP FB", "", "mint")
         top_bar.addWidget(title)
 
         top_bar.addStretch()
@@ -508,7 +508,7 @@ class LoginPage(QWidget):
         self._update_table(filter_type)
 
     def _toggle_select_all(self, state):
-        checked = state == Qt.Checked
+        checked = state == Qt.CheckState.Checked or state == 2
         for uuid, cb in self.profile_checkboxes.items():
             cb.blockSignals(True)
             cb.setChecked(checked)
@@ -1102,3 +1102,129 @@ class LoginPage(QWidget):
         self._stop_requested = True
         self.log("Đang dừng...", "warning")
         self.progress_label.setText("Đang dừng...")
+
+    # ============ CDP HELPER METHODS ============
+
+    def _cdp_send(self, ws, method: str, params: dict = None) -> dict:
+        """Gửi CDP command và nhận response"""
+        import json as json_module
+        if not ws:
+            return {"error": "No WebSocket connection", "ws_closed": True}
+
+        if not hasattr(self, '_cdp_id'):
+            self._cdp_id = 0
+        self._cdp_id += 1
+        msg = {"id": self._cdp_id, "method": method, "params": params or {}}
+
+        try:
+            ws.send(json_module.dumps(msg))
+        except Exception as e:
+            return {"error": f"WebSocket send failed: {str(e)}", "ws_closed": True}
+
+        while True:
+            try:
+                ws.settimeout(30)
+                resp = ws.recv()
+                data = json_module.loads(resp)
+                if data.get('id') == self._cdp_id:
+                    return data
+            except Exception as e:
+                return {"error": f"WebSocket recv failed: {str(e)}", "ws_closed": True}
+
+    def _cdp_evaluate(self, ws, expression: str):
+        """Evaluate JavaScript trong browser"""
+        result = self._cdp_send(ws, "Runtime.evaluate", {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": True
+        })
+        return result.get('result', {}).get('result', {}).get('value')
+
+    def _is_ws_connected(self, ws) -> bool:
+        """Kiểm tra WebSocket còn kết nối không"""
+        if not ws:
+            return False
+        try:
+            result = self._cdp_send(ws, "Runtime.evaluate", {
+                "expression": "1+1",
+                "returnByValue": True
+            })
+            if result.get('ws_closed'):
+                return False
+            return result.get('result', {}).get('result', {}).get('value') == 2
+        except:
+            return False
+
+    def _is_browser_alive(self, cdp_base: str) -> bool:
+        """Kiểm tra browser còn chạy không"""
+        try:
+            resp = requests.get(f"{cdp_base}/json/version", timeout=3)
+            return resp.status_code == 200
+        except:
+            return False
+
+    def _get_or_create_ws(self, ws, cdp_base: str, target_url: str = None):
+        """Kiểm tra WS hiện tại, nếu không ok thì tạo tab mới"""
+        if self._is_ws_connected(ws):
+            return (ws, True)
+
+        if not self._is_browser_alive(cdp_base):
+            return (None, False)
+
+        try:
+            resp = requests.get(f"{cdp_base}/json", timeout=10)
+            pages = resp.json()
+            for p in pages:
+                if p.get('type') == 'page':
+                    ws_url = p.get('webSocketDebuggerUrl')
+                    if ws_url:
+                        try:
+                            new_ws = websocket.create_connection(ws_url, timeout=30, suppress_origin=True)
+                            return (new_ws, True)
+                        except:
+                            pass
+        except:
+            pass
+
+        return (ws, False)
+
+    def _close_old_tabs(self, cdp_base: str):
+        """Đóng hết tab cũ, giữ lại 1 tab"""
+        import json as json_module
+        try:
+            resp = requests.get(f"{cdp_base}/json", timeout=10)
+            all_pages = resp.json()
+            page_targets = [p for p in all_pages if p.get('type') == 'page']
+
+            if len(page_targets) > 0:
+                first_tab_ws = page_targets[0].get('webSocketDebuggerUrl')
+                if first_tab_ws:
+                    try:
+                        temp_ws = websocket.create_connection(first_tab_ws, timeout=10, suppress_origin=True)
+                        temp_ws.send(json_module.dumps({
+                            "id": 1,
+                            "method": "Page.navigate",
+                            "params": {"url": "about:blank"}
+                        }))
+                        temp_ws.recv()
+                        temp_ws.close()
+                    except:
+                        pass
+
+                if len(page_targets) > 1:
+                    for p in page_targets[1:]:
+                        target_id = p.get('id')
+                        if target_id:
+                            requests.get(f"{cdp_base}/json/close/{target_id}", timeout=5)
+        except:
+            pass
+
+    def _type_like_human(self, ws, text: str) -> bool:
+        """Gõ từng ký tự như người thật"""
+        import random
+        for char in text:
+            result = self._cdp_send(ws, "Input.insertText", {"text": char})
+            if result.get('ws_closed'):
+                return False
+            time.sleep(random.uniform(0.05, 0.15))
+        return True

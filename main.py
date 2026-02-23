@@ -4,7 +4,18 @@ FB Manager Pro - Main Application
 """
 
 import sys
+import os
 import threading
+
+# Fix Windows console encoding for Vietnamese
+if sys.platform == 'win32':
+    os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QFrame, QLabel, QStackedWidget, QTableWidgetItem, QMessageBox
@@ -24,7 +35,7 @@ from api_service import api
 from database import sync_profiles, get_profiles as db_get_profiles, update_profile_local
 
 # Import Tab Pages
-from tabs import LoginPage, PagesPage, ReelsPage, ContentPage, GroupsPage, ScriptsPage, PostsPage
+from tabs import LoginPage, PagesPage, ReelsPage, ContentPage, GroupsPage, ScriptsPage, PostsPage, InteractionPage
 
 
 class Sidebar(QWidget):
@@ -171,7 +182,7 @@ class ProfilesPage(QWidget):
         top_bar = QHBoxLayout()
         top_bar.setSpacing(12)
         
-        title = CyberTitle("Profiles", "Hidemium Browser", "pink")
+        title = CyberTitle("PROFILES", "", "pink")
         top_bar.addWidget(title)
         
         top_bar.addStretch()
@@ -682,13 +693,17 @@ class MainWindow(QMainWindow):
         self.groups_page = GroupsPage(self.log)
         self.pages.addWidget(self.groups_page)
 
-        # Scripts page
-        self.scripts_page = ScriptsPage(self.log)
+        # Scripts page - truyền groups_page để dùng chung logic đăng bài
+        self.scripts_page = ScriptsPage(self.log, self.groups_page)
         self.pages.addWidget(self.scripts_page)
 
         # Posts page
         self.posts_page = PostsPage(self.log)
         self.pages.addWidget(self.posts_page)
+        
+        # Interaction page
+        self.interaction_page = InteractionPage(self.log)
+        self.pages.addWidget(self.interaction_page)
         
         main_container_layout.addWidget(self.pages)
         
@@ -734,7 +749,7 @@ class MainWindow(QMainWindow):
         for tid, nav in self.sidebar.nav_items.items():
             nav.set_active(tid == tab_id)
         
-        tab_indices = {"profiles": 0, "login": 1, "pages": 2, "reels": 3, "content": 4, "groups": 5, "scripts": 6, "posts": 7}
+        tab_indices = {"profiles": 0, "login": 1, "pages": 2, "reels": 3, "content": 4, "groups": 5, "scripts": 6, "posts": 7, "interaction": 8}
         self.pages.setCurrentIndex(tab_indices.get(tab_id, 0))
         
         self.log(f"→ {tab_id.upper()}", "info")
@@ -768,6 +783,10 @@ def main():
     
     window = MainWindow()
     window.show()
+    # Khởi động OpenClaw API Server
+    from openclaw_api import start_api_server_thread
+    start_api_server_thread(8899)
+    print("[Main] OpenClaw API Server started on http://127.0.0.1:8899")
     
     sys.exit(app.exec())
 

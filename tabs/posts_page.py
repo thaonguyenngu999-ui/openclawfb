@@ -89,7 +89,7 @@ class PostsPage(QWidget):
 
         # Top bar
         top_bar = QHBoxLayout()
-        title = CyberTitle("Bài đăng", "Buff tương tác Like", "mint")
+        title = CyberTitle("BÀI ĐĂNG", "", "mint")
         top_bar.addWidget(title)
         top_bar.addStretch()
 
@@ -584,11 +584,11 @@ class PostsPage(QWidget):
 
     def _on_post_select(self, post_id, state):
         """Khi chọn/bỏ chọn post"""
-        self.post_vars[post_id] = (state == Qt.Checked)
+        self.post_vars[post_id] = (state == Qt.CheckState.Checked or state == 2)
 
     def _toggle_select_all(self, state):
         """Toggle chọn tất cả"""
-        select_all = (state == Qt.Checked)
+        select_all = (state == Qt.CheckState.Checked or state == 2)
         for post_id in self.post_vars:
             self.post_vars[post_id] = select_all
         self._render_posts()
@@ -909,3 +909,93 @@ class PostsPage(QWidget):
 
         self.stat_total.set_value(str(total))
         self.stat_likes.set_value(str(total_likes))
+
+    # ============ CDP HELPER METHODS ============
+
+    def _cdp_send(self, ws, method: str, params: dict = None) -> dict:
+        """Gửi CDP command và nhận response"""
+        import json as json_module
+        if not ws:
+            return {"error": "No WebSocket connection", "ws_closed": True}
+
+        if not hasattr(self, '_cdp_id'):
+            self._cdp_id = 0
+        self._cdp_id += 1
+        msg = {"id": self._cdp_id, "method": method, "params": params or {}}
+
+        try:
+            ws.send(json_module.dumps(msg))
+        except Exception as e:
+            return {"error": f"WebSocket send failed: {str(e)}", "ws_closed": True}
+
+        while True:
+            try:
+                ws.settimeout(30)
+                resp = ws.recv()
+                data = json_module.loads(resp)
+                if data.get('id') == self._cdp_id:
+                    return data
+            except Exception as e:
+                return {"error": f"WebSocket recv failed: {str(e)}", "ws_closed": True}
+
+    def _cdp_evaluate(self, ws, expression: str):
+        """Evaluate JavaScript trong browser"""
+        result = self._cdp_send(ws, "Runtime.evaluate", {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": True
+        })
+        return result.get('result', {}).get('result', {}).get('value')
+
+    def _is_ws_connected(self, ws) -> bool:
+        """Kiểm tra WebSocket còn kết nối không"""
+        if not ws:
+            return False
+        try:
+            result = self._cdp_send(ws, "Runtime.evaluate", {
+                "expression": "1+1",
+                "returnByValue": True
+            })
+            if result.get('ws_closed'):
+                return False
+            return result.get('result', {}).get('result', {}).get('value') == 2
+        except:
+            return False
+
+    def _is_browser_alive(self, cdp_base: str) -> bool:
+        """Kiểm tra browser còn chạy không"""
+        import requests
+        try:
+            resp = requests.get(f"{cdp_base}/json/version", timeout=3)
+            return resp.status_code == 200
+        except:
+            return False
+
+    def _get_or_create_ws(self, ws, cdp_base: str, target_url: str = None):
+        """Kiểm tra WS hiện tại, nếu không ok thì tạo tab mới"""
+        import websocket
+        import requests
+        
+        if self._is_ws_connected(ws):
+            return (ws, True)
+
+        if not self._is_browser_alive(cdp_base):
+            return (None, False)
+
+        try:
+            resp = requests.get(f"{cdp_base}/json", timeout=10)
+            pages = resp.json()
+            for p in pages:
+                if p.get('type') == 'page':
+                    ws_url = p.get('webSocketDebuggerUrl')
+                    if ws_url:
+                        try:
+                            new_ws = websocket.create_connection(ws_url, timeout=30, suppress_origin=True)
+                            return (new_ws, True)
+                        except:
+                            pass
+        except:
+            pass
+
+        return (ws, False)
+

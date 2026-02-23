@@ -53,13 +53,8 @@ MENU_ITEMS = [
     {"id": "groups", "icon": "😸", "text": "Đăng nhóm", "color": "coral"},
     {"id": "scripts", "icon": "🐱", "text": "Kịch bản", "color": "blue"},
     {"id": "posts", "icon": "📊", "text": "Bài đăng", "color": "mint"},
+    {"id": "interaction", "icon": "🎯", "text": "Tương tác", "color": "rose"},
 ]
-
-# ========== API ==========
-API_CONFIG = {
-    "hidemium_base_url": "http://127.0.0.1:52000",
-    "timeout": 30,
-}
 
 # ========== QSS STYLESHEET - CUTE ==========
 CYBERPUNK_QSS = """

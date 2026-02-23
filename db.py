@@ -171,6 +171,7 @@ def init_database():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 profile_uuid TEXT NOT NULL,
                 group_id TEXT,
+                group_name TEXT,
                 content_id INTEGER,
                 post_url TEXT,
                 status TEXT DEFAULT 'pending',
@@ -178,6 +179,18 @@ def init_database():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        
+        # Migration: Add group_name column if not exists
+        try:
+            cursor.execute("ALTER TABLE post_history ADD COLUMN group_name TEXT")
+        except:
+            pass  # Column already exists
+
+        # Migration: Add content_preview column if not exists
+        try:
+            cursor.execute("ALTER TABLE post_history ADD COLUMN content_preview TEXT")
+        except:
+            pass  # Column already exists
 
         # ============ SCHEDULES TABLE ============
         cursor.execute("""
@@ -215,7 +228,9 @@ def init_database():
             ("delay_minutes", "INTEGER DEFAULT 5"),
             ("status", "TEXT DEFAULT 'active'"),
             ("last_run", "TEXT"),
-            ("next_run", "TEXT")
+            ("next_run", "TEXT"),
+            ("min_images", "INTEGER DEFAULT 0"),
+            ("max_images", "INTEGER DEFAULT 0")
         ]
         for col_name, col_type in new_schedule_columns:
             try:
@@ -271,6 +286,16 @@ def init_database():
                 ("Mặc định", "Category mặc định")
             )
 
+        # ============ SCHEDULE FOLDERS TABLE ============
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS schedule_folders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Tạo indexes để tăng tốc query
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_contents_category ON contents(category_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_profiles_uuid ON profiles(uuid)")
@@ -283,6 +308,7 @@ def init_database():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_reel_schedules_profile ON reel_schedules(profile_uuid)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_reel_schedules_status ON reel_schedules(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_posted_reels_profile ON posted_reels(profile_uuid)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_schedules_folder ON schedules(folder_id)")
         
         # Thêm composite indexes cho performance tốt hơn
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_post_history_profile_date ON post_history(profile_uuid, created_at DESC)")
@@ -332,7 +358,7 @@ def migrate_from_json():
             except Exception as e:
                 print(f"Error migrating {table}: {e}")
     
-    return migrated")
+    return migrated
 
 
 def row_to_dict(row) -> Dict:
@@ -844,6 +870,11 @@ def save_page(data: Dict) -> Dict:
 
         profile_uuid = data.get('profile_uuid', '')
         page_id = data.get('page_id', '')
+        
+        # Validate required fields
+        if not profile_uuid or not page_id:
+            print(f"[DB] save_page SKIP: missing profile_uuid={profile_uuid} or page_id={page_id}")
+            return data
 
         # Check if page already exists for this profile
         cursor.execute(
@@ -871,6 +902,7 @@ def save_page(data: Dict) -> Dict:
                 existing['id']
             ))
             data['id'] = existing['id']
+            print(f"[DB] Updated page id={existing['id']}")
         else:
             # Insert
             cursor.execute("""
@@ -890,6 +922,7 @@ def save_page(data: Dict) -> Dict:
                 now, now
             ))
             data['id'] = cursor.lastrowid
+            print(f"[DB] Inserted new page id={data['id']}")
 
         return data
 
@@ -927,11 +960,20 @@ def update_page_selection(page_id: int, is_selected: int) -> bool:
 def sync_pages(profile_uuid: str, pages_from_scan: List[Dict]):
     """Đồng bộ pages từ scan vào database"""
     saved_count = 0
+    print(f"[DB] sync_pages: {len(pages_from_scan)} pages for {profile_uuid}")
     for page in pages_from_scan:
         page['profile_uuid'] = profile_uuid
-        result = save_page(page)
-        if result.get('id'):
-            saved_count += 1
+        print(f"[DB] Saving page: {page}")
+        try:
+            result = save_page(page)
+            print(f"[DB] Save result: {result}")
+            if result and result.get('id'):
+                saved_count += 1
+        except Exception as e:
+            print(f"[DB] Error saving page: {e}")
+            import traceback
+            traceback.print_exc()
+    print(f"[DB] Total saved: {saved_count}")
     return saved_count
 
 
@@ -1109,12 +1151,14 @@ def save_post_history(data: Dict) -> Dict:
         now = datetime.now().isoformat()
 
         cursor.execute("""
-            INSERT INTO post_history (profile_uuid, group_id, content_id, post_url, status, error_message, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO post_history (profile_uuid, group_id, group_name, content_id, content_preview, post_url, status, error_message, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             data.get('profile_uuid', ''),
             data.get('group_id', ''),
+            data.get('group_name', ''),
             data.get('content_id'),
+            data.get('content_preview', ''),
             data.get('post_url', ''),
             data.get('status', 'pending'),
             data.get('error_message', ''),
@@ -1125,20 +1169,30 @@ def save_post_history(data: Dict) -> Dict:
 
 
 def get_post_history_filtered(
-    profile_uuid: str,
+    profile_uuid: str = None,
     date_from: str = None,
     status: str = None,
     limit: int = 50,
-    offset: int = 0
+    offset: int = 0,
+    days_back: int = None
 ) -> List[Dict]:
     """Lấy lịch sử đăng bài với filtering"""
     with get_connection() as conn:
         cursor = conn.cursor()
 
-        conditions = ["profile_uuid = ?"]
-        params = [profile_uuid]
+        conditions = []
+        params = []
+
+        if profile_uuid:
+            conditions.append("profile_uuid = ?")
+            params.append(profile_uuid)
 
         if date_from:
+            conditions.append("DATE(created_at) >= ?")
+            params.append(date_from)
+        elif days_back is not None:
+            from datetime import datetime, timedelta
+            date_from = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
             conditions.append("DATE(created_at) >= ?")
             params.append(date_from)
 
@@ -1148,13 +1202,14 @@ def get_post_history_filtered(
 
         conditions.append("post_url IS NOT NULL AND post_url != ''")
 
-        where_clause = " AND ".join(conditions)
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
 
         query = f"""
-            SELECT id, profile_uuid, group_id, content_id, post_url, status, error_message, created_at
-            FROM post_history
+            SELECT ph.id, ph.profile_uuid, ph.group_id, ph.group_name, ph.content_id, ph.post_url, 
+                   ph.status, ph.error_message, ph.created_at
+            FROM post_history ph
             WHERE {where_clause}
-            ORDER BY created_at DESC
+            ORDER BY ph.created_at DESC
             LIMIT ? OFFSET ?
         """
         params.extend([limit, offset])
@@ -1164,18 +1219,28 @@ def get_post_history_filtered(
 
 
 def get_post_history_count(
-    profile_uuid: str,
+    profile_uuid: str = None,
     date_from: str = None,
-    status: str = None
+    status: str = None,
+    days_back: int = None
 ) -> int:
     """Đếm số lượng post history với filtering"""
     with get_connection() as conn:
         cursor = conn.cursor()
 
-        conditions = ["profile_uuid = ?"]
-        params = [profile_uuid]
+        conditions = []
+        params = []
+
+        if profile_uuid:
+            conditions.append("profile_uuid = ?")
+            params.append(profile_uuid)
 
         if date_from:
+            conditions.append("DATE(created_at) >= ?")
+            params.append(date_from)
+        elif days_back is not None:
+            from datetime import datetime, timedelta
+            date_from = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
             conditions.append("DATE(created_at) >= ?")
             params.append(date_from)
 
@@ -1185,24 +1250,66 @@ def get_post_history_count(
 
         conditions.append("post_url IS NOT NULL AND post_url != ''")
 
-        where_clause = " AND ".join(conditions)
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
 
         cursor.execute(f"SELECT COUNT(*) FROM post_history WHERE {where_clause}", params)
         return cursor.fetchone()[0]
 
 
+# ==================== SCHEDULE FOLDERS ====================
+
+def get_schedule_folders() -> List[Dict]:
+    """Lấy danh sách thư mục lịch đăng"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM schedule_folders ORDER BY name")
+        return rows_to_list(cursor.fetchall())
+
+
+def save_schedule_folder(name: str, description: str = "") -> int:
+    """Tạo thư mục lịch đăng mới"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO schedule_folders (name, description) VALUES (?, ?)",
+            (name, description)
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def delete_schedule_folder(folder_id: int) -> bool:
+    """Xóa thư mục lịch đăng"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        # Xóa các schedules trong folder
+        cursor.execute("DELETE FROM schedules WHERE folder_id = ?", (str(folder_id),))
+        # Xóa folder
+        cursor.execute("DELETE FROM schedule_folders WHERE id = ?", (folder_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+
+
 # ==================== SCHEDULES ====================
 
-def get_schedules(status: str = None, active_only: bool = False) -> List[Dict]:
+def get_schedules(status: str = None, active_only: bool = False, folder_id: int = None) -> List[Dict]:
     """Lấy danh sách schedules"""
     with get_connection() as conn:
         cursor = conn.cursor()
+        conditions = []
+        params = []
+        
         if status:
-            cursor.execute("SELECT * FROM schedules WHERE status = ? ORDER BY id", (status,))
-        elif active_only:
-            cursor.execute("SELECT * FROM schedules WHERE is_active = 1 OR status = 'active' ORDER BY id")
-        else:
-            cursor.execute("SELECT * FROM schedules ORDER BY id")
+            conditions.append("status = ?")
+            params.append(status)
+        if active_only:
+            conditions.append("(is_active = 1 OR status = 'active')")
+        if folder_id is not None:
+            conditions.append("folder_id = ?")
+            params.append(str(folder_id))
+        
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        cursor.execute(f"SELECT * FROM schedules WHERE {where_clause} ORDER BY id", params)
         return rows_to_list(cursor.fetchall())
 
 
@@ -1232,19 +1339,26 @@ def save_schedule(data: Dict) -> Dict:
             if data.get('group_id') or data.get('profile_uuid'):
                 cursor.execute("""
                     INSERT INTO schedules (
-                        name, profile_uuid, group_id, group_name, group_url,
-                        content_id, content_title, time_slots, days_of_week,
-                        posts_per_run, delay_minutes, status, created_at, updated_at
+                        name, folder_id, folder_name, profile_uuid, group_id, group_name, group_url,
+                        content_id, content_title, content_category_id, image_folder, min_images, max_images,
+                        time_slots, days_of_week, posts_per_run, delay_minutes, 
+                        status, created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     data.get('name', data.get('group_name', '')),
+                    data.get('folder_id'),
+                    data.get('folder_name', ''),
                     data.get('profile_uuid', ''),
                     data.get('group_id'),
                     data.get('group_name', ''),
                     data.get('group_url', ''),
                     data.get('content_id'),
                     data.get('content_title', ''),
+                    data.get('category_id'),  # category_id -> content_category_id
+                    data.get('image_folder', ''),
+                    data.get('min_images', 0),
+                    data.get('max_images', 0),
                     data.get('time_slots', ''),
                     data.get('days_of_week', ''),
                     data.get('posts_per_run', 1),

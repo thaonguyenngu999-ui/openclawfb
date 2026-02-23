@@ -126,7 +126,7 @@ class CDPClient:
                     self.ws = websocket.create_connection(
                         self.page_ws_url,
                         timeout=30,
-                        origin=f"http://127.0.0.1:{self.remote_port}"
+                        suppress_origin=True
                     )
                     break
                 except Exception as e:
@@ -164,16 +164,25 @@ class CDPClient:
             'params': params or {}
         }
 
-        self.ws.send(json.dumps(msg))
+        try:
+            self.ws.send(json.dumps(msg))
+        except Exception as e:
+            raise Exception(f"WebSocket send failed for {method}: {e}")
 
-        # Wait for response with matching id
-        while True:
+        # Wait for response with matching id (max 60s)
+        deadline = time.time() + 60
+        while time.time() < deadline:
             try:
                 resp = json.loads(self.ws.recv())
                 if resp.get('id') == self._msg_id:
                     return resp
             except websocket.WebSocketTimeoutException:
                 raise Exception(f"Timeout waiting for {method}")
+            except (websocket.WebSocketConnectionClosedException, ConnectionError, OSError) as e:
+                raise Exception(f"WebSocket closed during {method}: {e}")
+            except Exception as e:
+                raise Exception(f"WebSocket error during {method}: {e}")
+        raise Exception(f"Deadline exceeded waiting for {method}")
 
     def _evaluate_js(self, expression: str) -> Any:
         """Evaluate JavaScript and return result"""

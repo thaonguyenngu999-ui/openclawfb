@@ -223,12 +223,15 @@ class HidemiumAPI:
         from automation.window_manager import WindowManager
         scale_factor = WindowManager.SCALE_FACTOR
         scale_flag = f"--force-device-scale-factor={scale_factor}"
+        
+        # Thêm flag cho CDP WebSocket access
+        cdp_flag = "--remote-allow-origins=*"
 
         if command:
-            # Append scale flag to existing command
-            params["command"] = f"{command} {scale_flag}"
+            # Append flags to existing command
+            params["command"] = f"{command} {scale_flag} {cdp_flag}"
         else:
-            params["command"] = scale_flag
+            params["command"] = f"{scale_flag} {cdp_flag}"
 
         if proxy:
             params["proxy"] = proxy

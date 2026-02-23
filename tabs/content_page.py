@@ -50,7 +50,7 @@ class ContentPage(QWidget):
         top_bar = QHBoxLayout()
         top_bar.setSpacing(12)
 
-        title = CyberTitle("Soạn Tin", "Quản lý nội dung đăng bài", "yellow")
+        title = CyberTitle("SOẠN TIN", "", "yellow")
         top_bar.addWidget(title)
 
         top_bar.addStretch()
@@ -670,7 +670,7 @@ class ContentPage(QWidget):
 
     def _toggle_select_all(self, state):
         """Toggle select all contents"""
-        checked = state == Qt.Checked
+        checked = state == Qt.CheckState.Checked or state == 2
         count = 0
         for content_id, cb in self.content_checkboxes.items():
             cb.setChecked(checked)

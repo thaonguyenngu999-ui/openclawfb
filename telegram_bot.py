@@ -1,0 +1,1046 @@
+#!/usr/bin/env python3
+"""
+FB Manager Pro Telegram Bot — NLP-powered.
+Primary: Pollinations.ai gemini-fast (Google Gemini 2.5 Flash Lite, ultra-cheap)
+Fallback: JanAI Devstral-24B (local, FREE)
+Understands natural language like "s10 thoát hết nhóm" and executes FB Manager actions.
+"""
+
+import asyncio
+import json
+import re
+import sys
+import aiohttp
+import logging
+from telegram import Update
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    filters, ContextTypes
+)
+from telegram.request import HTTPXRequest
+
+# Fix UTF-8 for Windows
+sys.stdout.reconfigure(encoding='utf-8')
+
+# Configuration
+TELEGRAM_BOT_TOKEN = "6891995669:AAHOlqrRiSoNzI1FcyqWemvpo5ZRxV4AKDI"
+FB_MANAGER_API = "http://127.0.0.1:8899"
+
+# Pollinations.ai (primary) — gemini-fast = Google Gemini 2.5 Flash Lite
+# 3,200 responses/pollen, 0.01/M input, 0.4/M output — ultra cheap
+POLLINATIONS_API = "https://gen.pollinations.ai/v1"
+POLLINATIONS_KEY = "sk_3HRi9HUGLup7OKB6ykRds8YtnpcmLHD3"
+POLLINATIONS_MODEL = "gemini-fast"  # Google Gemini 2.5 Flash Lite
+
+# JanAI local (fallback) — Devstral-24B, FREE, no internet needed
+JANAI_API = "http://127.0.0.1:1337/v1"
+DEVSTRAL_MODEL = "Devstral-Small-2-24B-Instruct-2512-IQ4_XS"
+
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# Conversation memory (per chat_id)
+# ============================================================
+from collections import deque
+
+# chat_id -> deque of {role, content} (last N messages)
+CONVERSATION_HISTORY = {}
+MAX_HISTORY = 10  # Keep last 10 exchanges
+
+def get_history(chat_id: str) -> list:
+    """Get conversation history for a chat."""
+    return list(CONVERSATION_HISTORY.get(chat_id, []))
+
+def add_to_history(chat_id: str, role: str, content: str):
+    """Add a message to conversation history."""
+    if chat_id not in CONVERSATION_HISTORY:
+        CONVERSATION_HISTORY[chat_id] = deque(maxlen=MAX_HISTORY)
+    CONVERSATION_HISTORY[chat_id].append({"role": role, "content": content})
+
+# ============================================================
+# SYSTEM PROMPT for NLP intent parsing
+# ============================================================
+SYSTEM_PROMPT = """You are an AI assistant for FB Manager Pro - a Facebook automation tool.
+Your job: Parse the user's Vietnamese/English message and return a JSON action.
+
+Available actions:
+1. open_browser - Open browser for a profile
+2. close_browser - Close browser for a profile
+3. list_profiles - List all browser profiles (optionally filter by folder)
+4. check_login - Quick check if a profile is logged into Facebook (requires browser open)
+5. check_fb_status - Full check: open browser → navigate FB → detect status → close (standalone)
+6. debug_groups - List all Facebook groups a profile has joined
+7. leave_groups - Leave/cancel all Facebook groups for a profile
+8. watch_reels - Watch Facebook Reels, optionally like and comment randomly
+9. screenshot - Take screenshot of current browser state
+10. navigate - Navigate browser to a specific URL
+11. batch_check_login - Check login status of ALL profiles in a folder concurrently
+12. fb_read_feed - Read Facebook news feed, extract visible posts
+13. fb_comment - Comment on a specific post in the feed
+14. fb_nurture_batch - Batch nurture: read feed + auto-comment on multiple profiles
+15. login_fb - Login Facebook with uid/password
+16. vision_capture - Capture browser screenshot for AI vision analysis
+17. vision_click - AI vision: find and click an element by description (e.g. "nút Tạo bài viết")
+18. vision_type - AI vision: find an input and type text (e.g. target="search box", text="hello")
+19. agent_execute - Autonomous AI agent: for ANY task not covered above. Agent will screenshot, analyze DOM, plan steps, and execute automatically. Use this for complex/unknown tasks.
+20. chat - Just chat, no action needed
+
+Profile naming convention:
+- "S10", "s10", "S 10" → profile = "S10"
+- "fb1", "FB1", "fb2" → this is the FOLDER name, not profile
+- Folder mapping: fb1 = folder 1 (S1-S17), fb2 = folder 2 (S30-S70), fb5 = folder 5 (A100-A194), fb6 = folder 6 (A200-A307)
+
+RESPOND WITH ONLY a JSON object, nothing else:
+{"action": "ACTION_NAME", "params": {...}, "reply": "Vietnamese response"}
+
+Examples:
+{"action": "leave_groups", "params": {"profile": "S10"}, "reply": "OK, đang thoát hết nhóm S10..."}
+{"action": "open_browser", "params": {"profile": "S10"}, "reply": "Đang mở browser S10..."}
+{"action": "check_login", "params": {"profile": "S10"}, "reply": "Đang kiểm tra login S10..."}
+{"action": "check_fb_status", "params": {"profile": "S10"}, "reply": "Đang check trạng thái FB S10..."}
+{"action": "list_profiles", "params": {"folder_id": "fb1"}, "reply": "Đang lấy danh sách profiles fb1..."}
+{"action": "debug_groups", "params": {"profile": "S10"}, "reply": "Đang kiểm tra groups S10..."}
+{"action": "close_browser", "params": {"profile": "S10"}, "reply": "Đang đóng browser S10..."}
+{"action": "screenshot", "params": {"profile": "S10"}, "reply": "Đang chụp S10..."}
+{"action": "watch_reels", "params": {"profile": "S15", "count": 5, "comment": true, "comment_count": 3}, "reply": "Đang xem reels S15 và comment ngẫu nhiên..."}
+{"action": "watch_reels", "params": {"profile": "S10", "count": 10, "comment": false}, "reply": "Đang xem 10 reels S10..."}
+{"action": "batch_check_login", "params": {"folder_id": "fb2", "concurrency": 10}, "reply": "Đang check login fb2 (10 luồng)..."}
+{"action": "fb_read_feed", "params": {"profile": "S10", "scroll_count": 3}, "reply": "Đang đọc feed S10..."}
+{"action": "fb_comment", "params": {"profile": "S10", "post_index": 0, "comment": "Hay quá!"}, "reply": "Đang comment bài đầu tiên..."}
+{"action": "fb_nurture_batch", "params": {"profiles": ["S10", "S11", "S15"], "max_workers": 3, "comments_per_profile": 2}, "reply": "Đang nuôi 3 profile (3 luồng)..."}
+{"action": "login_fb", "params": {"profile": "S10", "fb_id": "100xxx", "password": "abc123"}, "reply": "Đang login S10..."}
+{"action": "navigate", "params": {"profile": "S10", "url": "https://facebook.com/groups"}, "reply": "Đang navigate..."}
+{"action": "vision_capture", "params": {"profile": "S10"}, "reply": "Đang chụp ảnh phân tích..."}
+{"action": "vision_click", "params": {"profile": "S10", "target": "nút Tạo bài viết"}, "reply": "Đang tìm và click 'nút Tạo bài viết'..."}
+{"action": "vision_type", "params": {"profile": "S10", "target": "ô tìm kiếm", "text": "hello"}, "reply": "Đang gõ vào ô tìm kiếm..."}
+{"action": "agent_execute", "params": {"profile": "S10", "task": "xem thông báo, click ngẫu nhiên 1 thông báo"}, "reply": "🤖 Agent đang thực hiện..."}
+{"action": "chat", "params": {}, "reply": "Chào bác!"}
+
+MULTIPLE ACTIONS IN ONE MESSAGE:
+If the user requests multiple different actions for different profiles in one message, return a JSON ARRAY:
+[
+  {"action": "leave_groups", "params": {"profile": "S17"}, "reply": "S17 đang thoát nhóm..."},
+  {"action": "watch_reels", "params": {"profile": "S15", "count": 5, "comment": true, "comment_count": 3}, "reply": "S15 xem reels..."}
+]
+
+IMPORTANT:
+- Always return valid JSON only. No markdown, no explanation.
+- Use conversation history context to understand "check nó", "folder đó", etc.
+- When user says "10 luồng" or "5 threads", set concurrency accordingly.
+- "nuôi" = fb_nurture_batch, "lướt feed" = fb_read_feed, "comment" = fb_comment
+- "vision", "phân tích", "nhìn", "tìm nút" = vision_click/vision_capture
+- For tasks NOT covered by actions 1-18, use agent_execute. NEVER say "chưa hỗ trợ".
+- agent_execute can do ANY browser task: xem thông báo, gửi tin nhắn, tìm kiếm, đăng bài, etc.
+- Only use array when genuinely multiple actions. Single action = single object.
+"""
+
+
+# ============================================================
+# AI providers (Pollinations primary, JanAI fallback)
+# ============================================================
+async def call_pollinations(messages: list, max_tokens: int = 300, temperature: float = 0.1) -> str:
+    """Call Pollinations.ai (gemini-fast = Gemini 2.5 Flash Lite). Ultra cheap."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "model": POLLINATIONS_MODEL,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "stream": False
+            }
+            headers = {
+                "Authorization": f"Bearer {POLLINATIONS_KEY}",
+                "Content-Type": "application/json"
+            }
+            async with session.post(
+                f"{POLLINATIONS_API}/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    content = data["choices"][0]["message"]["content"]
+                    logger.info(f"Pollinations OK ({POLLINATIONS_MODEL})")
+                    return content
+                else:
+                    error_text = await resp.text()
+                    logger.warning(f"Pollinations {resp.status}: {error_text[:200]}")
+                    return None  # Signal to try fallback
+    except Exception as e:
+        logger.warning(f"Pollinations error: {e}")
+        return None  # Signal to try fallback
+
+
+async def call_janai(messages: list, max_tokens: int = 500, temperature: float = 0.3) -> str:
+    """Call Devstral-24B via JanAI (local fallback, FREE)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "model": DEVSTRAL_MODEL,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "stream": False
+            }
+            async with session.post(
+                f"{JANAI_API}/chat/completions",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=120)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    content = data["choices"][0]["message"]["content"]
+                    logger.info("JanAI fallback OK")
+                    return content
+                else:
+                    error_text = await resp.text()
+                    logger.error(f"JanAI {resp.status}: {error_text[:300]}")
+                    return f'{{"action":"chat","params":{{}},"reply":"Lỗi AI: cả Pollinations lẫn JanAI đều fail"}}'
+    except Exception as e:
+        logger.error(f"JanAI error: {e}")
+        return f'{{"action":"chat","params":{{}},"reply":"Lỗi kết nối AI: {e}"}}'
+
+
+async def call_ai(messages: list, max_tokens: int = 300, temperature: float = 0.1) -> str:
+    """Try Pollinations first (fast, cheap), fallback to JanAI (local, free)."""
+    result = await call_pollinations(messages, max_tokens, temperature)
+    if result is not None:
+        return result
+    logger.info("Falling back to JanAI...")
+    return await call_janai(messages, max_tokens, temperature)
+
+
+async def call_fb_api(endpoint: str, method: str = "POST", data: dict = None) -> dict:
+    """Call FB Manager Pro API."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{FB_MANAGER_API}{endpoint}"
+            if method == "POST":
+                async with session.post(url, json=data or {}, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+                    return await resp.json()
+            else:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    return await resp.json()
+    except Exception as e:
+        logger.error(f"FB API error: {e}")
+        return {"error": str(e)}
+
+
+def parse_ai_response(text: str) -> dict | list:
+    """Extract JSON from AI response, handling markdown code blocks. Returns dict or list of dicts."""
+    text = text.strip()
+    # Try to find JSON in code blocks
+    json_match = re.search(r'```(?:json)?\s*(\[.*?\]|\{.*?\})\s*```', text, re.DOTALL)
+    if json_match:
+        text = json_match.group(1)
+    # Try to find raw JSON array first
+    if not json_match:
+        array_match = re.search(r'(\[\s*\{.*?\}\s*\])', text, re.DOTALL)
+        if array_match:
+            text = array_match.group(1)
+    # Try to find raw JSON object
+    if not json_match and not text.startswith('['):
+        json_match2 = re.search(r'(\{[^{}]*"action"[^{}]*\})', text, re.DOTALL)
+        if json_match2:
+            text = json_match2.group(1)
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return parsed  # Multiple actions
+        return parsed  # Single action
+    except json.JSONDecodeError:
+        logger.warning(f"Failed to parse AI response as JSON: {text[:200]}")
+        return {"action": "chat", "params": {}, "reply": text[:500]}
+
+
+# ============================================================
+# Action executors
+# ============================================================
+async def execute_action(action: dict, telegram_chat_id: str = None, telegram_message_id: int = None) -> str:
+    """Execute the parsed action and return result text."""
+    act = action.get("action", "chat")
+    params = action.get("params", {})
+    reply = action.get("reply", "Đang xử lý...")
+    profile = params.get("profile", "")
+
+    if act == "chat":
+        return reply
+
+    if act == "open_browser":
+        if not profile:
+            return "❌ Thiếu tên profile. VD: 's10 mở browser'"
+        result = await call_fb_api("/open_browser", data={"profile": profile})
+        if "error" in result:
+            return f"❌ Mở browser {profile} thất bại: {result['error']}"
+        return f"✅ Đã mở browser cho `{profile}`"
+
+    if act == "close_browser":
+        if not profile:
+            return "❌ Thiếu tên profile."
+        result = await call_fb_api("/close", data={"profile": profile})
+        if "error" in result:
+            return f"❌ Đóng browser {profile} thất bại: {result['error']}"
+        return f"✅ Đã đóng browser `{profile}`"
+
+    if act == "list_profiles":
+        folder_id = params.get("folder_id")
+        data = {}
+        if folder_id:
+            data["folder_id"] = folder_id
+        result = await call_fb_api("/list_profiles", data=data)
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        profiles = result.get("data", result.get("profiles", []))
+        # Hidemium API returns nested: {data: {content: [...], ...}}
+        if isinstance(profiles, dict):
+            profiles = profiles.get("content", [])
+        if not profiles:
+            return "📱 Không tìm thấy profiles nào."
+        text = f"📱 **Profiles** ({len(profiles)}):\n"
+        for p in profiles[:20]:
+            name = p.get("name", "?")
+            text += f"• `{name}`\n"
+        if len(profiles) > 20:
+            text += f"... +{len(profiles)-20} profiles khác"
+        return text
+
+    if act == "check_login":
+        if not profile:
+            return "❌ Thiếu tên profile."
+        result = await call_fb_api("/check_login", data={"profile": profile})
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        logged_in = result.get("logged_in", False)
+        if logged_in:
+            return f"✅ `{profile}` đã login Facebook"
+        else:
+            return f"❌ `{profile}` chưa login Facebook"
+
+    if act == "debug_groups":
+        if not profile:
+            return "❌ Thiếu tên profile."
+        result = await call_fb_api("/debug_groups", data={"profile": profile})
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        total = result.get("total_groups", 0)
+        groups = result.get("groups", [])
+        text = f"🔍 **Groups - {profile}**: {total} nhóm\n"
+        for i, g in enumerate(groups[:15], 1):
+            name = g.get("group_name", "N/A")
+            text += f"{i}. `{name}`\n"
+        if total > 15:
+            text += f"... +{total-15} nhóm khác"
+        return text
+
+    if act == "leave_groups":
+        if not profile:
+            return "❌ Thiếu tên profile."
+        data = {"profile": profile}
+        # Pass telegram info for live progress updates
+        if telegram_chat_id and telegram_message_id:
+            data["telegram_chat_id"] = str(telegram_chat_id)
+            data["telegram_message_id"] = telegram_message_id
+        result = await call_fb_api("/leave_groups", data=data)
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        left = result.get("left", 0)
+        failed = result.get("failed", 0)
+        skipped = result.get("skipped", 0)
+        total = result.get("total_groups", 0)
+        text = f"✅ *Thoát nhóm - {profile}*\n"
+        text += f"📊 Tổng: {total} | ✅ Thoát: {left} | ❌ Lỗi: {failed} | ⏭ Bỏ qua: {skipped}\n"
+        if result.get("screenshot"):
+            text += "📸 Screenshot đã gửi\n"
+        errors = result.get("errors", [])
+        if errors:
+            for err in errors[:3]:
+                text += f"• {err}\n"
+        return text
+
+    if act == "screenshot":
+        if not profile:
+            return "❌ Thiếu tên profile."
+        result = await call_fb_api("/screenshot", data={"profile": profile})
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        return f"📸 Đã chụp `{profile}`: {result.get('filepath', 'OK')}"
+
+    if act == "check_fb_status":
+        if not profile:
+            return "❌ Thiếu tên profile."
+        result = await call_fb_api("/check_fb_status", data={"profile": profile})
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        status = result.get("status", "unknown")
+        return f"📊 `{profile}` status: {status}"
+
+    if act == "navigate":
+        url = params.get("url", "")
+        if not url:
+            return "❌ Thiếu URL."
+        result = await call_fb_api("/navigate", data={"url": url, "profile": profile})
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        return f"✅ Đã navigate đến {url}"
+
+    if act == "watch_reels":
+        if not profile:
+            return "❌ Thiếu tên profile."
+        count = int(params.get("count", 5))
+        do_comment = params.get("comment", True)
+        comment_count = int(params.get("comment_count", 3))
+        data = {
+            "profile": profile,
+            "count": count,
+            "comment": do_comment,
+            "comment_count": comment_count
+        }
+        if telegram_chat_id and telegram_message_id:
+            data["telegram_chat_id"] = str(telegram_chat_id)
+            data["telegram_message_id"] = telegram_message_id
+        result = await call_fb_api("/watch_reels", data=data)
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        watched = result.get("watched", 0)
+        liked = result.get("liked", 0)
+        commented = result.get("commented", 0)
+        text = f"🎬 *Xem Reels - {profile}*\n\n"
+        text += f"👁 Đã xem: {watched}/{count}\n"
+        text += f"❤️ Like: {liked}\n"
+        text += f"💬 Comment: {commented}\n"
+        if result.get("screenshot"):
+            text += "📸 Screenshot đã gửi"
+        return text
+
+    if act == "batch_check_login":
+        folder_id = params.get("folder_id")
+        concurrency = params.get("concurrency", 5)
+        if not folder_id:
+            return "❌ Thiếu folder. VD: 'check fb2 bao nhiêu live'"
+        # Step 1: Get profiles in folder
+        list_result = await call_fb_api("/list_profiles", data={"folder_id": folder_id, "page_size": 300})
+        if "error" in list_result:
+            return f"❌ Lỗi lấy profiles: {list_result['error']}"
+        profiles_list = list_result.get("data", [])
+        if isinstance(profiles_list, dict):
+            profiles_list = profiles_list.get("content", [])
+        if not profiles_list or not isinstance(profiles_list, list):
+            return f"📱 Không tìm thấy profiles nào trong {folder_id}."
+        
+        total = len(profiles_list)
+        profile_names = [p.get("name", "") for p in profiles_list if p.get("name")]
+        
+        # Step 2: Call /check_fb_batch — REAL parallel execution
+        # This opens N browsers simultaneously, navigates to FB, checks status, closes
+        if telegram_chat_id and telegram_message_id:
+            try:
+                async with aiohttp.ClientSession() as s:
+                    await s.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
+                        json={"chat_id": telegram_chat_id, "message_id": telegram_message_id,
+                              "text": f"🔍 Đang check {total} profiles ({concurrency} luồng song song)...\nMở browser → navigate FB → check status → đóng"}
+                    )
+            except Exception:
+                pass
+        
+        # Call the batch API with Telegram progress info for live updates
+        batch_result = await call_fb_api("/check_fb_batch", data={
+            "profiles": profile_names,
+            "max_workers": concurrency,
+            "close_after": True,
+            "telegram_chat_id": telegram_chat_id,
+            "telegram_message_id": telegram_message_id,
+            "telegram_token": TELEGRAM_BOT_TOKEN
+        })
+        
+        if "error" in batch_result:
+            return f"❌ Lỗi batch check: {batch_result['error']}"
+        
+        # Parse results
+        results = batch_result.get("results", [])
+        summary = batch_result.get("summary", {})
+        workers = batch_result.get("workers", concurrency)
+        
+        live_list = []
+        die_list = []
+        locked_list = []
+        error_list = []
+        
+        for r in results:
+            name = r.get("name", r.get("profile_uuid", "?")[:20])
+            status = r.get("status", "ERROR")
+            detail = r.get("detail", "")
+            if status == "LIVE":
+                live_list.append(f"{name} ({detail})" if detail and detail != status else name)
+            elif status in ("DIE", "NOT_LOGGED_IN"):
+                die_list.append(name)
+            elif status in ("LOCKED", "2FA"):
+                locked_list.append(f"{name} ({status})")
+            else:
+                error_list.append(f"{name}: {status}:{detail}" if detail else f"{name}: {status}")
+        
+        text = f"📊 **Check Login - {folder_id}** ({total} profiles, {workers} luồng)\n\n"
+        text += f"✅ Live: {len(live_list)}\n"
+        text += f"❌ Die: {len(die_list)}\n"
+        if locked_list:
+            text += f"🔒 Locked/2FA: {len(locked_list)}\n"
+        if error_list:
+            text += f"⚠️ Lỗi: {len(error_list)}\n"
+        text += f"\n"
+        if live_list:
+            text += f"**✅ Live ({len(live_list)}):**\n"
+            for n in live_list[:30]:
+                text += f"• `{n}`\n"
+            if len(live_list) > 30:
+                text += f"... +{len(live_list)-30} khác\n"
+        if die_list:
+            text += f"\n**❌ Die ({len(die_list)}):**\n"
+            for n in die_list[:30]:
+                text += f"• `{n}`\n"
+            if len(die_list) > 30:
+                text += f"... +{len(die_list)-30} khác\n"
+        if locked_list:
+            text += f"\n**🔒 Locked/2FA ({len(locked_list)}):**\n"
+            for n in locked_list[:10]:
+                text += f"• `{n}`\n"
+        if error_list:
+            text += f"\n**⚠️ Lỗi ({len(error_list)}):**\n"
+            for e in error_list[:10]:
+                text += f"• `{e}`\n"
+        return text
+
+    # ===== FEED =====
+    if act == "fb_read_feed":
+        if not profile:
+            return "❌ Thiếu tên profile."
+        scroll_count = int(params.get("scroll_count", 3))
+        result = await call_fb_api("/fb_read_feed", data={"profile": profile, "scroll_count": scroll_count})
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        posts = result.get("posts", [])
+        text = f"📰 *Feed - {profile}* ({len(posts)} bài)\n\n"
+        for i, p in enumerate(posts[:10]):
+            author = p.get("author", "?")
+            content = p.get("content", "")[:80]
+            text += f"{i}. *{author}*: {content}\n"
+        if len(posts) > 10:
+            text += f"... +{len(posts)-10} bài khác"
+        return text
+
+    if act == "fb_comment":
+        if not profile:
+            return "❌ Thiếu tên profile."
+        post_index = params.get("post_index", 0)
+        comment_text = params.get("comment", "")
+        if not comment_text:
+            return "❌ Thiếu nội dung comment."
+        result = await call_fb_api("/fb_comment", data={
+            "profile": profile, "post_index": int(post_index), "comment": comment_text
+        })
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        return f"✅ Đã comment bài #{post_index}: \"{comment_text[:50]}\""
+
+    if act == "fb_nurture_batch":
+        profiles_list = params.get("profiles", [])
+        max_workers = int(params.get("max_workers", 3))
+        comments_per = int(params.get("comments_per_profile", 2))
+        if not profiles_list:
+            return "❌ Thiếu danh sách profiles. VD: ['S10', 'S11']"
+        result = await call_fb_api("/fb_nurture_batch", data={
+            "profiles": profiles_list,
+            "max_workers": max_workers,
+            "comments_per_profile": comments_per
+        })
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        summary = result.get("summary", {})
+        text = f"🌱 *Nuôi hàng loạt* ({len(profiles_list)} profiles)\n\n"
+        text += f"✅ Thành công: {summary.get('success', 0)}\n"
+        text += f"❌ Lỗi: {summary.get('failed', 0)}\n"
+        text += f"💬 Tổng comment: {summary.get('total_comments', 0)}"
+        return text
+
+    # ===== LOGIN =====
+    if act == "login_fb":
+        if not profile:
+            return "❌ Thiếu tên profile."
+        fb_id = params.get("fb_id") or params.get("uid", "")
+        password = params.get("password") or params.get("pass", "")
+        if not fb_id or not password:
+            return "❌ Thiếu uid hoặc password."
+        result = await call_fb_api("/login_fb", data={
+            "profile": profile, "fb_id": fb_id, "password": password, "close_after": False
+        })
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        status = result.get("status", "unknown")
+        return f"🔐 Login {profile}: {status}"
+
+    # ===== VISION =====
+    if act == "vision_capture":
+        if not profile:
+            return "❌ Thiếu tên profile."
+        result = await call_fb_api("/vision_capture", data={"profile": profile})
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        w = result.get("width", "?")
+        h = result.get("height", "?")
+        return f"📸 Đã chụp vision {profile} ({w}x{h})"
+
+    if act == "vision_click":
+        if not profile:
+            return "❌ Thiếu tên profile."
+        target = params.get("target", "")
+        if not target:
+            return "❌ Thiếu mô tả element cần click."
+        result = await call_fb_api("/vision_click", data={
+            "profile": profile, "target": target, "max_retries": int(params.get("max_retries", 2))
+        })
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        method = result.get("method", "?")
+        return f"✅ Đã click '{target}' (method: {method})"
+
+    if act == "vision_type":
+        if not profile:
+            return "❌ Thiếu tên profile."
+        target = params.get("target", "")
+        text_to_type = params.get("text", "")
+        if not target or not text_to_type:
+            return "❌ Thiếu target hoặc text."
+        result = await call_fb_api("/vision_type", data={
+            "profile": profile, "target": target, "text": text_to_type
+        })
+        if "error" in result:
+            return f"❌ Lỗi: {result['error']}"
+        return f"✅ Đã gõ '{text_to_type[:30]}' vào '{target}'"
+
+    # ===== AGENT (catch-all for unknown tasks) =====
+    if act == "agent_execute":
+        if not profile:
+            return "❌ Thiếu tên profile."
+        task = params.get("task", "")
+        if not task:
+            return "❌ Thiếu mô tả task."
+        data = {"profile": profile, "task": task}
+        if telegram_chat_id and telegram_message_id:
+            data["telegram_chat_id"] = str(telegram_chat_id)
+            data["telegram_message_id"] = telegram_message_id
+        result = await call_fb_api("/agent_execute", data=data)
+        if "error" in result and not result.get("steps"):
+            return f"❌ Lỗi: {result['error']}"
+        steps = result.get("steps", [])
+        total = len(steps)
+        success = sum(1 for s in steps if s.get("ok"))
+        last = steps[-1] if steps else {}
+        last_desc = last.get("desc", "")
+        text = f"🤖 *Agent - {profile}*\n"
+        text += f"📋 Task: {task[:60]}\n\n"
+        if last_desc.startswith("DONE"):
+            text += f"✅ {last_desc[6:]}\n"
+        elif last_desc.startswith("FAILED"):
+            text += f"❌ {last_desc[8:]}\n"
+        else:
+            text += f"⚠️ {total} bước đã thực hiện\n"
+        text += f"\n📊 {success}✅ / {total} steps"
+        return text
+
+    return reply
+
+
+# ============================================================
+# Telegram handlers
+# ============================================================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "🤖 **FB Manager Pro Bot** (AI-powered)\n\n"
+        "Nói chuyện tự nhiên, tui tự hiểu:\n"
+        "• `s10 mở browser` / `đóng browser s10`\n"
+        "• `s10 thoát hết nhóm` / `xem groups s10`\n"
+        "• `check status s10` / `check fb1`\n"
+        "• `s10 xem 5 reels` / `nuôi s10`\n"
+        "• `đọc feed s10` / `chụp s10`\n"
+        "• `vision click nút Like` trên s10\n"
+        "• `liệt kê profiles fb1`\n\n"
+        "Gõ /help để xem đầy đủ.",
+        parse_mode="Markdown"
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "📋 **Hướng dẫn**\n\n"
+        "**🌐 Browser:**\n"
+        "`mở browser s10` · `đóng browser s10`\n\n"
+        "**🔍 Kiểm tra:**\n"
+        "`check login s10` · `check status s10`\n"
+        "`check fb1` (batch) · `liệt kê profiles fb1`\n\n"
+        "**👥 Groups & Reels:**\n"
+        "`s10 thoát hết nhóm` · `xem groups s10`\n"
+        "`s10 xem 5 reels comment`\n\n"
+        "**📰 Feed & Nuôi:**\n"
+        "`đọc feed s10` · `nuôi s10`\n\n"
+        "**📸 Screenshot & Vision:**\n"
+        "`chụp s10` · `vision capture s10`\n"
+        "`vision click nút Like trên s10`\n\n"
+        "**Lệnh nhanh:**\n"
+        "/open\\_browser S10 · /leave\\_groups S10\n"
+        "/debug\\_groups S10 · /profiles",
+        parse_mode="Markdown"
+    )
+
+
+async def open_browser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("VD: `/open_browser S10`", parse_mode="Markdown")
+        return
+    profile = " ".join(context.args)
+    msg = await update.message.reply_text(f"🌐 Đang mở browser {profile}...")
+    result = await execute_action({"action": "open_browser", "params": {"profile": profile}})
+    await msg.edit_text(result, parse_mode="Markdown")
+
+
+async def leave_groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("VD: `/leave_groups S10`", parse_mode="Markdown")
+        return
+    profile = " ".join(context.args)
+    msg = await update.message.reply_text(f"⏳ Đang thoát nhóm cho {profile}...")
+    chat_id = update.effective_chat.id
+    result = await execute_action(
+        {"action": "leave_groups", "params": {"profile": profile}},
+        telegram_chat_id=str(chat_id), telegram_message_id=msg.message_id
+    )
+    try:
+        await msg.edit_text(result, parse_mode="Markdown")
+    except Exception:
+        pass  # Message may already be updated by API
+
+
+async def debug_groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("VD: `/debug_groups S10`", parse_mode="Markdown")
+        return
+    profile = " ".join(context.args)
+    msg = await update.message.reply_text(f"🔍 Đang kiểm tra groups {profile}...")
+    result = await execute_action({"action": "debug_groups", "params": {"profile": profile}})
+    await msg.edit_text(result, parse_mode="Markdown")
+
+
+async def profiles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = await update.message.reply_text("📱 Đang lấy danh sách...")
+    folder_id = context.args[0] if context.args else None
+    result = await execute_action({"action": "list_profiles", "params": {"folder_id": folder_id}})
+    await msg.edit_text(result, parse_mode="Markdown")
+
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """NLP handler: parse user intent via Devstral, then execute."""
+    try:
+        await _message_handler_inner(update, context)
+    except Exception as e:
+        logger.error(f"message_handler error: {e}")
+        try:
+            await update.message.reply_text(f"⚠️ Lỗi: {str(e)[:200]}")
+        except Exception:
+            pass
+
+
+async def _message_handler_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inner handler with actual logic."""
+    user_msg = update.message.text
+    logger.info(f"User: {user_msg}")
+    chat_id = str(update.effective_chat.id)
+
+    # Quick pattern matching for common commands (no AI needed)
+    quick = try_quick_parse(user_msg)
+    if quick:
+        logger.info(f"Quick parse: {quick}")
+        # Save to history so AI has context
+        add_to_history(chat_id, "user", user_msg)
+        msg = await update.message.reply_text(quick.get("reply", "⏳ Đang xử lý..."))
+        result = await execute_action(quick, telegram_chat_id=chat_id, telegram_message_id=msg.message_id)
+        add_to_history(chat_id, "assistant", result[:300] if result else "Done")
+        try:
+            await msg.edit_text(result, parse_mode="Markdown")
+        except Exception:
+            try:
+                await msg.edit_text(result)
+            except Exception:
+                pass
+        return
+
+    # Send to AI for NLP parsing (with conversation history)
+    msg = await update.message.reply_text("🤔 Đang suy nghĩ...")
+    
+    # Build messages with history for context
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # Add conversation history (last N exchanges)
+    history = get_history(chat_id)
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_msg})
+    # Save user message to history
+    add_to_history(chat_id, "user", user_msg)
+    
+    ai_response = await call_ai(messages, max_tokens=500, temperature=0.1)
+    logger.info(f"AI raw: {ai_response[:300]}")
+    
+    parsed = parse_ai_response(ai_response)
+    
+    # Handle multi-action (list of actions)
+    if isinstance(parsed, list) and len(parsed) > 1:
+        logger.info(f"Multi-action: {len(parsed)} actions")
+        actions = parsed
+        # Send initial status
+        status_lines = []
+        for i, a in enumerate(actions):
+            profile = a.get("params", {}).get("profile", "?")
+            act = a.get("action", "?")
+            status_lines.append(f"⏳ {profile}: {a.get('reply', act)}")
+        await msg.edit_text("\n".join(status_lines))
+        
+        # Create separate messages for each action
+        action_msgs = []
+        for i, a in enumerate(actions):
+            if i == 0:
+                action_msgs.append(msg)  # Reuse first message
+            else:
+                new_msg = await update.message.reply_text(a.get("reply", "⏳ Đang xử lý..."))
+                action_msgs.append(new_msg)
+        
+        # Run all actions concurrently
+        async def run_single_action(action, action_msg):
+            try:
+                result = await execute_action(action, telegram_chat_id=chat_id, telegram_message_id=action_msg.message_id)
+                try:
+                    await action_msg.edit_text(result, parse_mode="Markdown")
+                except Exception:
+                    try:
+                        await action_msg.edit_text(result)
+                    except Exception:
+                        pass
+                return result
+            except Exception as e:
+                error_text = f"❌ Lỗi: {e}"
+                try:
+                    await action_msg.edit_text(error_text)
+                except Exception:
+                    pass
+                return error_text
+        
+        results = await asyncio.gather(*[
+            run_single_action(actions[i], action_msgs[i]) 
+            for i in range(len(actions))
+        ])
+        
+        # Save summary to history
+        summary = " | ".join([r[:100] if r else "Done" for r in results])
+        add_to_history(chat_id, "assistant", summary[:300])
+        return
+
+    # Single action (original flow)
+    action = parsed if isinstance(parsed, dict) else parsed[0] if isinstance(parsed, list) else {"action": "chat", "params": {}, "reply": str(parsed)}
+    logger.info(f"Parsed action: {action.get('action')} params={action.get('params')}")
+    
+    # If just chat, return AI reply directly
+    if action.get("action") == "chat":
+        reply_text = f"🤖 {action.get('reply', ai_response)}"
+        add_to_history(chat_id, "assistant", reply_text)
+        await msg.edit_text(reply_text)
+        return
+    
+    # Execute the action
+    try:
+        await msg.edit_text(action.get("reply", "⏳ Đang thực hiện..."))
+    except Exception as e:
+        logger.warning(f"edit_text reply failed: {e}")
+    result = await execute_action(action, telegram_chat_id=chat_id, telegram_message_id=msg.message_id)
+    # Save result summary to history — but keep it short to avoid AI copying raw output
+    act_name = action.get('action', 'unknown')
+    if act_name == 'agent_execute':
+        # Don't pollute history with agent raw output (AI copies it)
+        add_to_history(chat_id, "assistant", f"[Agent done: {action.get('params',{}).get('task','')}]")
+    else:
+        add_to_history(chat_id, "assistant", result[:300] if result else "Done")
+    try:
+        await msg.edit_text(result, parse_mode="Markdown")
+    except Exception:
+        # Retry without Markdown if parse fails
+        try:
+            await msg.edit_text(result)
+        except Exception as e2:
+            logger.warning(f"edit_text result failed: {e2}")
+
+
+def try_quick_parse(text: str) -> dict | None:
+    """Fast regex-based intent detection for common patterns (skip AI call)."""
+    text_lower = text.lower().strip()
+    
+    # Extract profile names (S10, s10, S 10, A100, a100, etc.)
+    profile_matches = re.findall(r'\b[sS]\s*(\d+)\b', text)
+    a_matches = re.findall(r'\b[aA]\s*(\d+)\b', text)
+    
+    # If multiple profiles mentioned, let AI handle multi-action
+    if len(profile_matches) + len(a_matches) > 1:
+        return None
+    
+    profile = None
+    if profile_matches:
+        profile = f"S{profile_matches[0]}"
+    elif a_matches:
+        profile = f"A{a_matches[0]}"
+    
+    # Extract folder (fb1, fb2, fb5, fb6)
+    folder_match = re.search(r'fb\s*(\d+)', text_lower)
+    folder_id = f"fb{folder_match.group(1)}" if folder_match else None
+
+    # ===== GROUPS =====
+    # Leave groups
+    if profile and re.search(r'thoát.*nhóm|leave.*group|rời.*nhóm|out.*group|xóa.*nhóm|hủy.*nhóm', text_lower):
+        return {"action": "leave_groups", "params": {"profile": profile}, "reply": f"⏳ Đang thoát hết nhóm cho {profile}..."}
+    
+    # Debug/list groups
+    if profile and re.search(r'xem.*group|debug.*group|list.*group|kiểm tra.*nhóm|liệt kê.*nhóm|bao nhiêu.*nhóm|nhóm.*đã.*tham gia', text_lower):
+        return {"action": "debug_groups", "params": {"profile": profile}, "reply": f"🔍 Đang xem groups {profile}..."}
+
+    # ===== REELS =====
+    if profile and re.search(r'xem.*reel|watch.*reel|lướt.*reel|mở.*reel|coi.*reel', text_lower):
+        do_comment = bool(re.search(r'comment|cmt|bình luận', text_lower))
+        count_match = re.search(r'(\d+)\s*(?:cái|reel|video)', text_lower)
+        count = int(count_match.group(1)) if count_match else 5
+        return {"action": "watch_reels", "params": {"profile": profile, "count": count, "comment": do_comment, "comment_count": 3}, "reply": f"🎬 Đang xem {count} reels cho {profile}..."}
+
+    # ===== FEED & NURTURE =====
+    # If user mentions feed/bảng tin + comment/like → nurture (full flow)
+    if profile and re.search(r'đọc.*feed|xem.*feed|lướt.*feed|read.*feed|newsfeed|bảng tin', text_lower):
+        has_interact = bool(re.search(r'cmt|comment|bình luận|like|thích|tương tác|ngẫu nhiên', text_lower))
+        if has_interact:
+            return {"action": "fb_nurture_batch", "params": {"profiles": [profile], "max_workers": 1, "comments_per_profile": 2}, "reply": f"🌱 Đang nuôi {profile} (lướt feed + cmt + like)..."}
+        return {"action": "fb_read_feed", "params": {"profile": profile, "scroll_count": 3}, "reply": f"📰 Đang đọc feed {profile}..."}
+    
+    # Nurture (nuôi)
+    if re.search(r'nuôi|nurture|dưỡng|warm.?up', text_lower):
+        if profile:
+            return {"action": "fb_nurture_batch", "params": {"profiles": [profile], "max_workers": 1, "comments_per_profile": 2}, "reply": f"🌱 Đang nuôi {profile}..."}
+        elif folder_id:
+            return None  # Let AI handle batch nurture with folder
+
+    # ===== BROWSER =====
+    if profile and re.search(r'mở.*browser|open.*browser|mở trình duyệt|bật.*browser', text_lower):
+        return {"action": "open_browser", "params": {"profile": profile}, "reply": f"🌐 Đang mở browser {profile}..."}
+    
+    if profile and re.search(r'đóng.*browser|close.*browser|tắt.*browser|kill.*browser', text_lower):
+        return {"action": "close_browser", "params": {"profile": profile}, "reply": f"🔒 Đang đóng browser {profile}..."}
+
+    # ===== LOGIN & STATUS =====
+    # Check FB status (full: open → navigate → check → close)
+    if profile and re.search(r'check.*status|kiểm tra.*trạng thái|fb.*status|live.*hay.*die|die.*hay.*live|status', text_lower):
+        return {"action": "check_fb_status", "params": {"profile": profile}, "reply": f"🔍 Đang check status {profile}..."}
+    
+    # Check login (quick, browser must be open)
+    if profile and re.search(r'login|đăng nhập|kiểm tra.*login|check.*login|đã.*đăng nhập', text_lower):
+        return {"action": "check_login", "params": {"profile": profile}, "reply": f"🔍 Đang kiểm tra login {profile}..."}
+    
+    # Batch check login (folder-level)
+    if folder_id and re.search(r'check|kiểm tra|bao nhiêu.*live|live.*die|die.*live', text_lower):
+        conc_match = re.search(r'(\d+)\s*(?:luồng|thread|worker)', text_lower)
+        concurrency = int(conc_match.group(1)) if conc_match else 5
+        return {"action": "batch_check_login", "params": {"folder_id": folder_id, "concurrency": concurrency}, "reply": f"🔍 Đang check {folder_id} ({concurrency} luồng)..."}
+
+    # ===== SCREENSHOT =====
+    if profile and re.search(r'chụp|screenshot|cap|snap|màn hình', text_lower):
+        return {"action": "screenshot", "params": {"profile": profile}, "reply": f"📸 Đang chụp {profile}..."}
+
+    # ===== VISION =====
+    if profile and re.search(r'vision.*click|click.*vision|tìm.*click|tìm.*nút|click.*nút|bấm.*nút|nhấn.*nút', text_lower):
+        # Extract target description after keywords
+        target_match = re.search(r'(?:click|bấm|nhấn|tìm)\s+(?:vào\s+)?(?:nút\s+)?["\']?(.+?)["\']?\s*$', text_lower)
+        target = target_match.group(1).strip() if target_match else ""
+        if not target:
+            return None  # Let AI extract target
+        return {"action": "vision_click", "params": {"profile": profile, "target": target}, "reply": f"🎯 Đang tìm và click '{target}'..."}
+    
+    if profile and re.search(r'vision.*capture|chụp.*vision|phân tích.*dom|phân tích.*giao diện|analyze', text_lower):
+        return {"action": "vision_capture", "params": {"profile": profile}, "reply": f"📸 Đang chụp vision {profile}..."}
+
+    # ===== LIST PROFILES =====
+    if re.search(r'liệt kê.*profile|list.*profile|profiles|danh sách.*profile', text_lower):
+        return {"action": "list_profiles", "params": {"folder_id": folder_id}, "reply": "📱 Đang lấy danh sách profiles..."}
+
+    # ===== AGENT (catch-all: profile + action-like keywords not matched above) =====
+    if profile and re.search(
+        r'thông báo|notification|bạn bè|friend|tin nhắn|message|messenger|'
+        r'marketplace|watch|story|stories|trang cá nhân|profile|'
+        r'chấp nhận|accept|xác nhận|confirm|từ chối|decline|'
+        r'gửi tin|send.*message|nhắn tin|đăng bài|post|'
+        r'tìm kiếm|search|xem.*trang|visit|theo dõi|follow|'
+        r'hủy kết bạn|unfriend|chặn|block|báo cáo|report', text_lower):
+        # Remove profile from text to get task description
+        task = re.sub(r'\b[sS]\s*\d+\b', '', text).strip()
+        task = re.sub(r'\b[aA]\s*\d+\b', '', task).strip()
+        if task:
+            return {"action": "agent_execute", "params": {"profile": profile, "task": task},
+                    "reply": f"🤖 Agent đang thực hiện cho {profile}..."}
+
+    return None  # Let AI handle it
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors and notify user."""
+    logger.error(f"Exception: {context.error}")
+    if update and hasattr(update, 'effective_chat'):
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⚠️ Lỗi hệ thống, thử lại nhé: {str(context.error)[:100]}"
+            )
+        except Exception:
+            pass
+
+
+def main():
+    """Start the bot."""
+    # Increase timeouts + connection pool for stability
+    request = HTTPXRequest(
+        connect_timeout=30.0,
+        read_timeout=60.0,
+        write_timeout=30.0,
+        pool_timeout=15.0,
+        connection_pool_size=20,
+    )
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .request(request)
+        .concurrent_updates(True)
+        .build()
+    )
+    
+    # Error handler
+    app.add_error_handler(error_handler)
+    
+    # Commands (still work)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("open_browser", open_browser_cmd))
+    app.add_handler(CommandHandler("profiles", profiles_cmd))
+    app.add_handler(CommandHandler("debug_groups", debug_groups_cmd))
+    app.add_handler(CommandHandler("leave_groups", leave_groups_cmd))
+    
+    # NLP text handler (catches everything else)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    
+    logger.info("🚀 Bot started (Pollinations gemini-fast + JanAI fallback + FB Manager Pro)")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()

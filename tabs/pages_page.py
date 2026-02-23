@@ -586,7 +586,7 @@ class PagesPage(QWidget):
         top_bar = QHBoxLayout()
         top_bar.setSpacing(12)
 
-        title = CyberTitle("Pages", "Quản lý Fanpage Facebook", "purple")
+        title = CyberTitle("PAGES", "", "purple")
         top_bar.addWidget(title)
 
         top_bar.addStretch()
@@ -851,15 +851,22 @@ class PagesPage(QWidget):
     def _filter_pages_by_profile(self):
         """Filter pages theo profile đã chọn"""
         profile_idx = self.profile_combo.currentIndex()
+        folder_idx = self.folder_combo.currentIndex()
 
         if profile_idx <= 0:
-            # All profiles - get pages for all current profiles
-            profile_uuids = [p.get('uuid') for p in self.profiles]
-            if profile_uuids:
-                self.pages = get_pages_for_profiles(profile_uuids)
-            else:
+            # All profiles selected
+            if folder_idx <= 0:
+                # All folders - get ALL pages from DB
                 self.pages = get_pages()
+            else:
+                # Specific folder - get pages for profiles in current list
+                profile_uuids = [p.get('uuid') for p in self.profiles]
+                if profile_uuids:
+                    self.pages = get_pages_for_profiles(profile_uuids)
+                else:
+                    self.pages = []
         else:
+            # Specific profile selected
             profile = self.profiles[profile_idx - 1]
             uuid = profile.get('uuid', '')
             self.pages = get_pages(uuid)
@@ -943,10 +950,13 @@ class PagesPage(QWidget):
 
     def _toggle_select_all(self, state):
         """Toggle chon tat ca pages"""
-        checked = state == Qt.Checked
+        # PySide6: state có thể là Qt.CheckState enum hoặc int
+        checked = state == Qt.CheckState.Checked or state == 2
         count = 0
         for page_id, cb in self.page_checkboxes.items():
+            cb.blockSignals(True)  # Tránh trigger nhiều lần
             cb.setChecked(checked)
+            cb.blockSignals(False)
             if checked:
                 count += 1
         self.selected_label.setText(f"✓ {count} đã chọn" if checked else "")
@@ -1017,13 +1027,15 @@ class PagesPage(QWidget):
 
                 # Lưu vào DB
                 if pages_found:
-                    sync_pages(uuid, pages_found)
+                    saved = sync_pages(uuid, pages_found)
+                    print(f"[DEBUG] Synced {saved} pages for {name}")
 
             self._is_scanning = False
             QTimer.singleShot(0, lambda: self.progress_bar.setVisible(False))
             QTimer.singleShot(0, lambda: self.progress_label.setText(""))
             QTimer.singleShot(0, lambda: self.log(f"Scan hoàn thành! Tìm thấy {total_pages_found} pages", "success"))
-            QTimer.singleShot(0, self._filter_pages_by_profile)
+            # Reload all data to show newly scanned pages
+            QTimer.singleShot(0, self._load_data)
 
         threading.Thread(target=do_scan, daemon=True).start()
 
@@ -1099,55 +1111,134 @@ class PagesPage(QWidget):
             ws.recv()
             time.sleep(8)
 
-            # Lấy HTML
+            # Sử dụng JavaScript để lấy danh sách Pages (Facebook render dynamic)
+            js_get_pages = '''
+            (function() {
+                var pages = [];
+                var seen = new Set();
+                
+                // Tìm tất cả các links trong trang
+                var allLinks = document.querySelectorAll('a[href*="facebook.com"]');
+                
+                for (var i = 0; i < allLinks.length; i++) {
+                    var link = allLinks[i];
+                    var href = link.href || '';
+                    var text = (link.innerText || '').trim();
+                    
+                    // Bỏ qua các links hệ thống
+                    var excludedPaths = ['groups', 'events', 'marketplace', 'watch', 'gaming', 
+                        'profile.php', 'settings', 'notifications', 'messages', 'friends', 
+                        'bookmarks', 'pages', 'help', 'privacy', 'policies', 'login', 'recover',
+                        'photo', 'video', 'stories', 'reels', 'ads', 'business'];
+                    
+                    // Kiểm tra xem có phải link page không
+                    // Format: facebook.com/pagename hoặc facebook.com/profile/pageid
+                    var pageMatch = href.match(/facebook\\.com\\/([^/?#]+)\\/?$/);
+                    var profileMatch = href.match(/facebook\\.com\\/profile\\.php\\?id=(\\d+)/);
+                    
+                    var pageId = null;
+                    var pageUrl = '';
+                    
+                    if (profileMatch) {
+                        pageId = profileMatch[1];
+                        pageUrl = 'https://www.facebook.com/profile.php?id=' + pageId;
+                    } else if (pageMatch) {
+                        var potentialId = pageMatch[1];
+                        // Kiểm tra không phải path hệ thống
+                        if (!excludedPaths.includes(potentialId.toLowerCase())) {
+                            pageId = potentialId;
+                            pageUrl = 'https://www.facebook.com/' + pageId;
+                        }
+                    }
+                    
+                    // Lọc: phải có tên và không trùng
+                    if (pageId && text && text.length > 1 && text.length < 100 && !seen.has(pageId)) {
+                        // Kiểm tra thêm: link phải nằm trong vùng "Trang bạn quản lý"
+                        var parent = link.closest('[role="main"]') || link.closest('[data-pagelet]');
+                        if (parent) {
+                            seen.add(pageId);
+                            pages.push({
+                                page_id: pageId,
+                                page_name: text,
+                                page_url: pageUrl
+                            });
+                        }
+                    }
+                }
+                
+                // Nếu không tìm được bằng cách trên, thử tìm theo cấu trúc khác
+                if (pages.length === 0) {
+                    // Tìm các card/item chứa thông tin page
+                    var pageCards = document.querySelectorAll('[role="listitem"], [role="article"]');
+                    for (var j = 0; j < pageCards.length; j++) {
+                        var card = pageCards[j];
+                        var cardLink = card.querySelector('a[href*="facebook.com"]');
+                        if (cardLink) {
+                            var cardHref = cardLink.href || '';
+                            var cardText = '';
+                            
+                            // Tìm tên page trong card
+                            var spans = card.querySelectorAll('span');
+                            for (var k = 0; k < spans.length; k++) {
+                                var spanText = (spans[k].innerText || '').trim();
+                                if (spanText.length > 2 && spanText.length < 100 && !spanText.includes('thông báo') && !spanText.includes('Tạo')) {
+                                    cardText = spanText;
+                                    break;
+                                }
+                            }
+                            
+                            if (cardText && cardHref) {
+                                var match = cardHref.match(/facebook\\.com\\/([^/?#]+)/);
+                                var idMatch = cardHref.match(/id=(\\d+)/);
+                                
+                                var pId = idMatch ? idMatch[1] : (match ? match[1] : null);
+                                if (pId && !seen.has(pId) && pId !== 'pages' && pId !== 'profile.php') {
+                                    seen.add(pId);
+                                    pages.push({
+                                        page_id: pId,
+                                        page_name: cardText,
+                                        page_url: cardHref.split('?')[0]
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                return JSON.stringify(pages);
+            })();
+            '''
+            
             ws.send(json_module.dumps({
                 "id": 2,
                 "method": "Runtime.evaluate",
-                "params": {"expression": "document.documentElement.outerHTML"}
+                "params": {"expression": js_get_pages}
             }))
-            html_result = json_module.loads(ws.recv())
-            html = html_result.get('result', {}).get('result', {}).get('value', '')
-
+            js_result = json_module.loads(ws.recv())
+            pages_json = js_result.get('result', {}).get('result', {}).get('value', '[]')
+            
+            print(f"[ScanPages] JS Result: {pages_json}")
+            
+            try:
+                found_pages = json_module.loads(pages_json)
+            except:
+                found_pages = []
+            
             ws.close()
 
-            # Parse HTML
-            if html and BS4_AVAILABLE:
-                soup = BeautifulSoup(html, 'html.parser')
+            # Chuyển đổi kết quả
+            for p in found_pages:
+                pages_found.append({
+                    'page_id': p.get('page_id', ''),
+                    'page_name': p.get('page_name', '')[:100],
+                    'page_url': p.get('page_url', ''),
+                    'profile_uuid': profile_uuid,
+                    'follower_count': 0,
+                    'role': 'admin',
+                    'category': ''
+                })
 
-                # Tìm các page links
-                page_links = soup.find_all('a', href=re.compile(r'facebook\.com/[^/]+/?$|/pages/[^/]+'))
-
-                seen_ids = set()
-                for link in page_links:
-                    href = link.get('href', '')
-
-                    # Lấy page ID hoặc username
-                    page_id = None
-                    if '/pages/' in href:
-                        match = re.search(r'/pages/([^/?]+)', href)
-                        if match:
-                            page_id = match.group(1)
-                    else:
-                        match = re.search(r'facebook\.com/([^/?]+)', href)
-                        if match:
-                            page_id = match.group(1)
-
-                    if page_id and page_id not in seen_ids and page_id not in ['groups', 'events', 'marketplace', 'watch', 'gaming']:
-                        seen_ids.add(page_id)
-
-                        # Lấy tên page
-                        page_name = link.get_text(strip=True) or f"Page {page_id}"
-
-                        pages_found.append({
-                            'page_id': page_id,
-                            'page_name': page_name[:100],
-                            'profile_uuid': profile_uuid,
-                            'follower_count': 0,
-                            'role': 'admin',
-                            'category': ''
-                        })
-
-                self.log(f"Tìm thấy {len(pages_found)} pages cho {profile_name}", "success")
+            self.log(f"Tìm thấy {len(pages_found)} pages cho {profile_name}", "success")
 
         except Exception as e:
             import traceback
@@ -1203,3 +1294,175 @@ class PagesPage(QWidget):
             deleted = delete_pages_bulk(selected_ids)
             self.log(f"Đã xóa {deleted} pages", "success")
             self._filter_pages_by_profile()
+
+    # ============ CDP HELPER METHODS ============
+
+    def _cdp_send(self, ws, method: str, params: dict = None) -> dict:
+        """Gửi CDP command và nhận response"""
+        if not ws:
+            return {"error": "No WebSocket connection", "ws_closed": True}
+
+        if not hasattr(self, '_cdp_id'):
+            self._cdp_id = 0
+        self._cdp_id += 1
+        msg = {"id": self._cdp_id, "method": method, "params": params or {}}
+
+        try:
+            ws.send(json_module.dumps(msg))
+        except Exception as e:
+            return {"error": f"WebSocket send failed: {str(e)}", "ws_closed": True}
+
+        while True:
+            try:
+                ws.settimeout(30)
+                resp = ws.recv()
+                data = json_module.loads(resp)
+                if data.get('id') == self._cdp_id:
+                    return data
+            except Exception as e:
+                return {"error": f"WebSocket recv failed: {str(e)}", "ws_closed": True}
+
+    def _cdp_evaluate(self, ws, expression: str):
+        """Evaluate JavaScript trong browser"""
+        result = self._cdp_send(ws, "Runtime.evaluate", {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": True
+        })
+        return result.get('result', {}).get('result', {}).get('value')
+
+    def _is_ws_connected(self, ws) -> bool:
+        """Kiểm tra WebSocket còn kết nối không"""
+        if not ws:
+            return False
+        try:
+            result = self._cdp_send(ws, "Runtime.evaluate", {
+                "expression": "1+1",
+                "returnByValue": True
+            })
+            if result.get('ws_closed'):
+                return False
+            return result.get('result', {}).get('result', {}).get('value') == 2
+        except:
+            return False
+
+    def _is_browser_alive(self, cdp_base: str) -> bool:
+        """Kiểm tra browser còn chạy không"""
+        try:
+            resp = requests.get(f"{cdp_base}/json/version", timeout=3)
+            return resp.status_code == 200
+        except:
+            return False
+
+    def _get_or_create_ws(self, ws, cdp_base: str, target_url: str = None):
+        """
+        Kiểm tra WS hiện tại, nếu không ok thì tạo tab mới.
+        Returns: (ws, success)
+        """
+        if self._is_ws_connected(ws):
+            return (ws, True)
+
+        print(f"[Pages] WebSocket mất kết nối, đang reconnect...")
+
+        if not self._is_browser_alive(cdp_base):
+            print(f"[Pages] Browser đã đóng hoàn toàn")
+            return (None, False)
+
+        try:
+            resp = requests.get(f"{cdp_base}/json", timeout=10)
+            pages = resp.json()
+            for p in pages:
+                if p.get('type') == 'page':
+                    ws_url = p.get('webSocketDebuggerUrl')
+                    if ws_url:
+                        try:
+                            new_ws = websocket.create_connection(ws_url, timeout=30, suppress_origin=True)
+                            print(f"[Pages] Đã reconnect WS")
+                            return (new_ws, True)
+                        except:
+                            pass
+        except:
+            pass
+
+        if target_url:
+            try:
+                resp = requests.get(f"{cdp_base}/json/new?{target_url}", timeout=10)
+                new_page = resp.json()
+                ws_url = new_page.get('webSocketDebuggerUrl')
+                if ws_url:
+                    new_ws = websocket.create_connection(ws_url, timeout=30, suppress_origin=True)
+                    return (new_ws, True)
+            except Exception as e:
+                print(f"[Pages] Không tạo được tab mới: {e}")
+
+        return (ws, False)
+
+    def _close_old_tabs(self, cdp_base: str):
+        """Đóng hết tab cũ, giữ lại 1 tab về about:blank"""
+        try:
+            resp = requests.get(f"{cdp_base}/json", timeout=10)
+            all_pages = resp.json()
+            page_targets = [p for p in all_pages if p.get('type') == 'page']
+
+            if len(page_targets) > 0:
+                first_tab_ws = page_targets[0].get('webSocketDebuggerUrl')
+                if first_tab_ws:
+                    try:
+                        temp_ws = websocket.create_connection(first_tab_ws, timeout=10, suppress_origin=True)
+                        temp_ws.send(json_module.dumps({
+                            "id": 1,
+                            "method": "Page.navigate",
+                            "params": {"url": "about:blank"}
+                        }))
+                        temp_ws.recv()
+                        temp_ws.close()
+                    except:
+                        pass
+
+                if len(page_targets) > 1:
+                    for p in page_targets[1:]:
+                        target_id = p.get('id')
+                        if target_id:
+                            requests.get(f"{cdp_base}/json/close/{target_id}", timeout=5)
+                    time.sleep(1)
+        except Exception as e:
+            print(f"[Pages] Lỗi đóng tab cũ: {e}")
+
+    def _type_like_human(self, ws, text: str, typo_chance: float = 0.03) -> bool:
+        """Gõ từng ký tự như người thật"""
+        typo_map = {
+            'a': ['s', 'q'], 'b': ['v', 'n'], 'c': ['x', 'v'],
+            'd': ['s', 'f'], 'e': ['w', 'r'], 'f': ['d', 'g'],
+            'g': ['f', 'h'], 'h': ['g', 'j'], 'i': ['u', 'o'],
+            'j': ['h', 'k'], 'k': ['j', 'l'], 'l': ['k', 'o'],
+            'm': ['n'], 'n': ['b', 'm'], 'o': ['i', 'p'],
+            'p': ['o'], 'q': ['w'], 'r': ['e', 't'],
+            's': ['a', 'd'], 't': ['r', 'y'], 'u': ['y', 'i'],
+            'v': ['c', 'b'], 'w': ['q', 'e'], 'x': ['z', 'c'],
+            'y': ['t', 'u'], 'z': ['x']
+        }
+
+        for char in text:
+            if char.lower() in typo_map and random.random() < typo_chance:
+                wrong_char = random.choice(typo_map[char.lower()])
+                result = self._cdp_send(ws, "Input.insertText", {"text": wrong_char})
+                if result.get('ws_closed'):
+                    return False
+                time.sleep(random.uniform(0.05, 0.15))
+                self._cdp_send(ws, "Input.dispatchKeyEvent", {"type": "keyDown", "key": "Backspace", "code": "Backspace"})
+                self._cdp_send(ws, "Input.dispatchKeyEvent", {"type": "keyUp", "key": "Backspace", "code": "Backspace"})
+                time.sleep(random.uniform(0.1, 0.2))
+
+            result = self._cdp_send(ws, "Input.insertText", {"text": char})
+            if result.get('ws_closed'):
+                return False
+
+            if char in ' .,!?':
+                time.sleep(random.uniform(0.08, 0.2))
+            elif char.isupper():
+                time.sleep(random.uniform(0.06, 0.15))
+            else:
+                time.sleep(random.uniform(0.03, 0.1))
+
+        return True
+

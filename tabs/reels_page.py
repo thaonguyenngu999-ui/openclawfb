@@ -90,7 +90,7 @@ class ReelsPage(QWidget):
         top_bar = QHBoxLayout()
         top_bar.setSpacing(12)
 
-        title = CyberTitle("Reels", "Đăng Reels lên Fanpage", "pink")
+        title = CyberTitle("REELS", "", "pink")
         top_bar.addWidget(title)
 
         top_bar.addStretch()
@@ -269,7 +269,7 @@ class ReelsPage(QWidget):
         """)
         self.schedule_datetime.setEnabled(False)
         self.schedule_cb.stateChanged.connect(
-            lambda state: self.schedule_datetime.setEnabled(state == Qt.Checked)
+            lambda state: self.schedule_datetime.setEnabled(state == Qt.CheckState.Checked or state == 2)
         )
         schedule_row.addWidget(self.schedule_datetime, 1)
 
@@ -496,12 +496,22 @@ class ReelsPage(QWidget):
 
         # Load pages for this profile
         self.pages = get_pages(self.selected_profile_uuid)
+        
+        # Kiểm tra xem có page nào bị lỗi data không
+        invalid_pages = [p for p in self.pages if p.get('page_id') == 'profile.php' or not p.get('page_url')]
+        if invalid_pages:
+            self.log(f"⚠️ Có {len(invalid_pages)} Pages cần quét lại (page_id hoặc page_url bị lỗi)", "warning")
 
         self.page_combo.clear()
         self.page_combo.addItem("-- Chọn Page --")
         for page in self.pages:
             name = page.get('page_name', 'Unknown')
-            self.page_combo.addItem(f"📄 {name}")
+            page_id = page.get('page_id', '')
+            # Đánh dấu page lỗi
+            if page_id == 'profile.php' or not page.get('page_url'):
+                self.page_combo.addItem(f"⚠️ {name} (cần quét lại)")
+            else:
+                self.page_combo.addItem(f"📄 {name}")
 
         self.stat_pages.set_value(str(len(self.pages)))
 
@@ -638,9 +648,43 @@ class ReelsPage(QWidget):
         profile_uuid = page.get('profile_uuid') or self.selected_profile_uuid
         page_id = page.get('page_id', '')
         page_name = page.get('page_name', 'Unknown')
-        page_url = page.get('page_url', f"https://www.facebook.com/{page_id}")
+        page_url = page.get('page_url', '')
+        
+        # Debug: In ra thông tin page
+        print(f"[ReelsPage] Page data: {page}")
+        print(f"[ReelsPage] page_id={page_id}, page_url={page_url}")
+        
+        # Xử lý page_id từ page_url nếu page_id rỗng hoặc không phải số
+        if not page_id or page_id == 'profile.php':
+            # Thử lấy page_id từ page_url
+            if page_url:
+                # URL có thể là: https://www.facebook.com/123456789 hoặc https://www.facebook.com/pagename
+                import re
+                # Thử match số ID
+                match = re.search(r'facebook\.com/(\d+)', page_url)
+                if match:
+                    page_id = match.group(1)
+                else:
+                    # Lấy phần cuối của URL (username/pagename)
+                    match = re.search(r'facebook\.com/([^/?]+)', page_url)
+                    if match and match.group(1) != 'profile.php':
+                        page_id = match.group(1)
+        
+        # Nếu vẫn không có page_id và page_url, sử dụng page_name (cần search)
+        need_search_page = False
+        if not page_id or page_id == 'profile.php':
+            if not page_url or 'profile.php' in page_url:
+                print(f"[ReelsPage] No valid page_id/url, will search by name: {page_name}")
+                need_search_page = True
+        
+        # Tạo page_url nếu có page_id hợp lệ
+        if not need_search_page:
+            if not page_url or 'profile.php' in page_url:
+                if page_id and page_id != 'profile.php':
+                    page_url = f"https://www.facebook.com/{page_id}"
 
         print(f"[ReelsPage] Đang đăng Reels lên {page_name}...")
+        print(f"[ReelsPage] Final page_id={page_id}, page_url={page_url}, need_search={need_search_page}")
         print(f"[ReelsPage] Video: {self.video_path}")
         print(f"[ReelsPage] Caption: {caption[:50] if caption else 'N/A'}...")
 
@@ -669,15 +713,169 @@ class ReelsPage(QWidget):
                 raise Exception("Không kết nối được CDPHelper")
 
             print(f"[ReelsPage] CDPHelper connected!")
-            QTimer.singleShot(0, lambda: self.progress_label.setText("Đang vào trang..."))
+            QTimer.singleShot(0, lambda: self.progress_label.setText("Đang reset về trang cá nhân..."))
 
-            # Bước 3: Navigate đến page
+            # ===== Bước 2.5: Reset về profile cá nhân trước =====
+            print(f"[ReelsPage] STEP 1: Navigate to personal Facebook...")
+            cdp.navigate("https://www.facebook.com")
+            cdp.wait_for_page_load()
+            time.sleep(3)
+
+            # Kiểm tra xem đang ở context nào (Page hay cá nhân)
+            js_check_context = '''
+            (function() {
+                // Kiểm tra xem có đang ở trong Page context không
+                var switchBtn = document.querySelector('[aria-label*="Chuyển sang"], [aria-label*="Switch to"]');
+                if (switchBtn) {
+                    var label = switchBtn.getAttribute('aria-label') || '';
+                    // Nếu có nút "Chuyển sang [tên cá nhân]" => đang ở Page context
+                    if (label.includes('Chuyển sang') || label.includes('Switch to')) {
+                        return 'in_page_context: ' + label;
+                    }
+                }
+                return 'in_personal_context';
+            })();
+            '''
+            context_check = cdp.execute_js(js_check_context)
+            print(f"[ReelsPage] Current context: {context_check}")
+
+            # Nếu đang ở Page context, switch về cá nhân
+            if 'in_page_context' in str(context_check):
+                print(f"[ReelsPage] Currently in Page context, switching to personal...")
+                
+                # Click vào menu account
+                js_open_account_menu = '''
+                (function() {
+                    var menuSelectors = [
+                        '[aria-label="Tài khoản của bạn"]',
+                        '[aria-label="Your account"]',
+                        '[aria-label="Account"]',
+                        '[aria-label="Tài khoản"]'
+                    ];
+                    
+                    for (var sel of menuSelectors) {
+                        var el = document.querySelector(sel);
+                        if (el) {
+                            var clickable = el.closest('[role="button"]') || el.closest('div[tabindex="0"]') || el;
+                            if (clickable) {
+                                clickable.click();
+                                return 'clicked_menu: ' + sel;
+                            }
+                        }
+                    }
+                    
+                    // Fallback: click nút cuối trong navigation
+                    var navBtns = document.querySelectorAll('div[role="navigation"] [role="button"]');
+                    if (navBtns.length > 0) {
+                        navBtns[navBtns.length - 1].click();
+                        return 'clicked_last_nav_btn';
+                    }
+                    
+                    return 'no_account_menu';
+                })();
+                '''
+                menu_result = cdp.execute_js(js_open_account_menu)
+                print(f"[ReelsPage] Account menu: {menu_result}")
+                time.sleep(2)
+
+                # Click "Chuyển sang [profile cá nhân]"
+                js_switch_to_personal = '''
+                (function() {
+                    // Tìm tất cả nút có "Chuyển sang" hoặc "Switch to"
+                    var allButtons = document.querySelectorAll('[role="button"][aria-label*="Chuyển sang"], [role="button"][aria-label*="Switch to"]');
+                    
+                    for (var i = 0; i < allButtons.length; i++) {
+                        var btn = allButtons[i];
+                        var label = btn.getAttribute('aria-label') || '';
+                        
+                        if (btn.offsetParent !== null) {
+                            btn.click();
+                            return 'switched_to: ' + label;
+                        }
+                    }
+                    
+                    // Fallback: tìm trong listitem
+                    var listItems = document.querySelectorAll('[role="listitem"] [role="button"]');
+                    for (var i = 0; i < listItems.length; i++) {
+                        var btn = listItems[i];
+                        var label = btn.getAttribute('aria-label') || '';
+                        if (label.includes('Chuyển sang') || label.includes('Switch to')) {
+                            btn.click();
+                            return 'switched_via_listitem: ' + label;
+                        }
+                    }
+                    
+                    return 'no_switch_button';
+                })();
+                '''
+                switch_personal_result = cdp.execute_js(js_switch_to_personal)
+                print(f"[ReelsPage] Switch to personal: {switch_personal_result}")
+                time.sleep(3)
+                
+                # Refresh lại trang để đảm bảo context đã reset
+                cdp.navigate("https://www.facebook.com")
+                cdp.wait_for_page_load()
+                time.sleep(2)
+            else:
+                print(f"[ReelsPage] Already in personal context, continue...")
+
+            # ===== Bước 3: Navigate đến Page =====
+            QTimer.singleShot(0, lambda: self.progress_label.setText("Đang vào trang Page..."))
+
+            # Nếu cần tìm Page theo tên
+            if need_search_page:
+                print(f"[ReelsPage] Searching for page by name: {page_name}")
+                
+                # Navigate đến trang quản lý Pages
+                cdp.navigate("https://www.facebook.com/pages/?category=your_pages")
+                cdp.wait_for_page_load()
+                time.sleep(5)
+                
+                # Tìm và click vào Page theo tên
+                js_find_page = f'''
+                (function() {{
+                    var pageName = "{page_name}";
+                    
+                    // Tìm tất cả links
+                    var links = document.querySelectorAll('a');
+                    for (var i = 0; i < links.length; i++) {{
+                        var link = links[i];
+                        var text = (link.innerText || '').trim();
+                        var href = link.href || '';
+                        
+                        // So sánh tên page
+                        if (text === pageName || text.includes(pageName) || pageName.includes(text)) {{
+                            // Kiểm tra href không phải profile.php
+                            if (href && !href.includes('profile.php') && href.includes('facebook.com')) {{
+                                // Trả về URL của page
+                                return href;
+                            }}
+                        }}
+                    }}
+                    
+                    return null;
+                }})();
+                '''
+                found_url = cdp.execute_js(js_find_page)
+                print(f"[ReelsPage] Found page URL: {found_url}")
+                
+                if found_url and 'facebook.com' in str(found_url):
+                    page_url = found_url
+                    # Cập nhật page_id từ URL
+                    url_match = re.search(r'facebook\.com/([^/?]+)', page_url)
+                    if url_match:
+                        page_id = url_match.group(1)
+                    print(f"[ReelsPage] Updated: page_id={page_id}, page_url={page_url}")
+                else:
+                    raise Exception(f"Không tìm thấy Page '{page_name}' trong danh sách. Vui lòng quét lại Pages!")
+
+            # Navigate đến page để switch context
             print(f"[ReelsPage] Navigating to page: {page_url}")
             cdp.navigate(page_url)
             cdp.wait_for_page_load()
             time.sleep(3)
 
-            # Click "Chuyển ngay" nếu có
+            # Click "Chuyển ngay" nếu có - để switch sang danh nghĩa Page
             js_click_switch = '''
             (function() {
                 var buttons = document.querySelectorAll('div[role="button"], span[role="button"]');
@@ -699,13 +897,100 @@ class ReelsPage(QWidget):
             if 'clicked' in str(switch_result):
                 time.sleep(3)
 
+            # ĐỢI đảm bảo context đã chuyển sang Page
+            time.sleep(2)
+
             # Bước 4: Navigate đến Reels creator
+            # Facebook không hỗ trợ URL /{page_id}/reels/create
+            # Phải dùng /reels/create và đã switch context sang Page trước đó
             QTimer.singleShot(0, lambda: self.progress_label.setText("Đang vào trang tạo Reel..."))
+            
             reels_create_url = "https://www.facebook.com/reels/create"
             print(f"[ReelsPage] Navigating to Reels creator: {reels_create_url}")
             cdp.navigate(reels_create_url)
             cdp.wait_for_page_load(timeout_ms=20000)
             time.sleep(3)
+            
+            # Kiểm tra xem có đúng trang tạo Reel không
+            current_url = cdp.execute_js("window.location.href")
+            print(f"[ReelsPage] Current URL after navigate: {current_url}")
+            
+            # Kiểm tra và chọn đăng dưới danh nghĩa Page nếu cần
+            js_check_and_select_page = f'''
+            (function() {{
+                var pageName = "{page_name}";
+                
+                // Tìm dropdown "Đăng với tư cách" / "Post as"
+                var dropdownSelectors = [
+                    '[aria-label*="Đăng với tư cách"]',
+                    '[aria-label*="Post as"]',
+                    '[aria-label*="Chia sẻ tới"]',
+                    '[aria-label*="Share to"]',
+                    '[aria-label*="Sharing to"]'
+                ];
+                
+                for (var sel of dropdownSelectors) {{
+                    var dropdown = document.querySelector(sel);
+                    if (dropdown) {{
+                        dropdown.click();
+                        return 'opened_dropdown: ' + sel;
+                    }}
+                }}
+                
+                // Tìm text hiển thị "Đang đăng với tư cách" để click vào
+                var spans = document.querySelectorAll('span');
+                for (var i = 0; i < spans.length; i++) {{
+                    var text = (spans[i].innerText || '').trim();
+                    if (text.includes('Đang đăng với tư cách') || text.includes('Posting as') || 
+                        text.includes('Chia sẻ tới') || text.includes('Sharing to')) {{
+                        var clickable = spans[i].closest('[role="button"]') || spans[i].parentElement;
+                        if (clickable) {{
+                            clickable.click();
+                            return 'clicked_posting_as';
+                        }}
+                    }}
+                }}
+                
+                return 'no_dropdown_found';
+            }})();
+            '''
+            dropdown_result = cdp.execute_js(js_check_and_select_page)
+            print(f"[ReelsPage] Dropdown result: {dropdown_result}")
+            
+            if 'opened' in str(dropdown_result) or 'clicked' in str(dropdown_result):
+                time.sleep(1.5)
+                
+                # Click vào Page trong dropdown
+                js_select_page = f'''
+                (function() {{
+                    var pageName = "{page_name}";
+                    
+                    // Tìm trong menu/dropdown
+                    var options = document.querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], [role="listitem"]');
+                    for (var opt of options) {{
+                        var text = (opt.innerText || '').trim();
+                        if (text.includes(pageName) || pageName.includes(text)) {{
+                            opt.click();
+                            return 'selected: ' + text;
+                        }}
+                    }}
+                    
+                    // Fallback: tìm tất cả các nút có tên page
+                    var allBtns = document.querySelectorAll('[role="button"]');
+                    for (var btn of allBtns) {{
+                        var text = (btn.innerText || '').trim();
+                        if (text.includes(pageName)) {{
+                            btn.click();
+                            return 'clicked_btn: ' + text;
+                        }}
+                    }}
+                    
+                    return 'page_not_found_in_list';
+                }})();
+                '''
+                select_result = cdp.execute_js(js_select_page)
+                print(f"[ReelsPage] Select page result: {select_result}")
+                time.sleep(2)
 
             # Bước 5: Upload video
             QTimer.singleShot(0, lambda: self.progress_label.setText("Đang upload video..."))
@@ -864,29 +1149,87 @@ class ReelsPage(QWidget):
             print(f"[ReelsPage] Waiting for Reel to be posted...")
             time.sleep(15)
 
-            # Bước 9: Tìm URL của Reel vừa đăng
-            js_get_reel_url = '''
+            # Bước 9: Tìm URL của Reel vừa đăng từ NOTIFICATION
+            js_get_reel_from_notification = '''
             (function() {
-                var links = document.querySelectorAll('a');
-                for (var i = 0; i < links.length; i++) {
-                    var href = links[i].href || '';
-                    if (href.includes('/reel/')) {
-                        var match = href.match(/\\/reel\\/(\\d{10,})/);
-                        if (match) {
-                            return 'https://www.facebook.com/reel/' + match[1];
+                var notificationSelectors = [
+                    '[role="alert"]',
+                    '[role="status"]',
+                    '[data-pagelet*="Toast"]',
+                    '[data-pagelet*="Notification"]',
+                    '[class*="toast"]',
+                    '[class*="notification"]',
+                    '[class*="Toast"]',
+                    '[class*="snackbar"]'
+                ];
+
+                for (var s = 0; s < notificationSelectors.length; s++) {
+                    var notifications = document.querySelectorAll(notificationSelectors[s]);
+                    for (var i = 0; i < notifications.length; i++) {
+                        var noti = notifications[i];
+
+                        var links = noti.querySelectorAll('a[href*="/reel/"]');
+                        for (var j = 0; j < links.length; j++) {
+                            var href = links[j].href || links[j].getAttribute('href') || '';
+                            var match = href.match(/\\/reel\\/(\\d{10,})/);
+                            if (match) {
+                                return 'NOTIFICATION:https://www.facebook.com/reel/' + match[1];
+                            }
+                        }
+
+                        var text = noti.innerText || noti.textContent || '';
+                        var textMatch = text.match(/facebook\\.com\\/reel\\/(\\d{10,})/);
+                        if (textMatch) {
+                            return 'NOTIFICATION_TEXT:https://www.facebook.com/reel/' + textMatch[1];
                         }
                     }
                 }
-                return '';
+
+                // Fallback: Tìm link "Xem thước phim" / "View your reel"
+                var viewReelTexts = ['Xem thước phim', 'View your reel', 'View reel', 'Xem Reel'];
+                var allLinks = document.querySelectorAll('a');
+                for (var i = 0; i < allLinks.length; i++) {
+                    var link = allLinks[i];
+                    var linkText = (link.innerText || '').trim();
+                    for (var t = 0; t < viewReelTexts.length; t++) {
+                        if (linkText.includes(viewReelTexts[t])) {
+                            var href = link.href || '';
+                            var match = href.match(/\\/reel\\/(\\d{10,})/);
+                            if (match) {
+                                return 'VIEW_REEL_LINK:https://www.facebook.com/reel/' + match[1];
+                            }
+                        }
+                    }
+                }
+
+                // Fallback 2: Tìm tất cả reel links
+                var allReelLinks = document.querySelectorAll('a[href*="/reel/"]');
+                for (var i = 0; i < allReelLinks.length; i++) {
+                    var href = allReelLinks[i].href || '';
+                    var match = href.match(/\\/reel\\/(\\d{10,})/);
+                    if (match) {
+                        return 'FALLBACK:https://www.facebook.com/reel/' + match[1];
+                    }
+                }
+
+                return 'no_reel_url';
             })();
             '''
 
             reel_url = None
-            for attempt in range(10):
-                result = cdp.execute_js(js_get_reel_url)
-                if result and 'facebook.com/reel/' in str(result):
-                    reel_url = result
-                    break
+            print(f"[ReelsPage] Looking for Reel URL in notifications...")
+
+            for attempt in range(15):
+                result = cdp.execute_js(js_get_reel_from_notification)
+                print(f"[ReelsPage] Attempt {attempt + 1}/15 - Result: {result}")
+
+                if result and result != 'no_reel_url':
+                    # Extract URL
+                    reel_match = re.search(r'(https?://[^\s]+/reel/\d{10,})', str(result))
+                    if reel_match:
+                        reel_url = reel_match.group(1).split('?')[0]
+                        print(f"[ReelsPage] Found Reel URL: {reel_url}")
+                        break
                 time.sleep(2)
 
             # Lưu vào database
@@ -1117,3 +1460,131 @@ class ReelsPage(QWidget):
                 delete_reel_schedule(schedule_id)
                 self.log("Đã xóa lịch hẹn", "success")
                 self._load_history()
+
+    # ============ CDP HELPER METHODS ============
+
+    def _cdp_send(self, ws, method: str, params: dict = None) -> dict:
+        """Gửi CDP command và nhận response"""
+        if not ws:
+            return {"error": "No WebSocket connection", "ws_closed": True}
+
+        if not hasattr(self, '_cdp_id'):
+            self._cdp_id = 0
+        self._cdp_id += 1
+        msg = {"id": self._cdp_id, "method": method, "params": params or {}}
+
+        try:
+            ws.send(json_module.dumps(msg))
+        except Exception as e:
+            return {"error": f"WebSocket send failed: {str(e)}", "ws_closed": True}
+
+        while True:
+            try:
+                ws.settimeout(30)
+                resp = ws.recv()
+                data = json_module.loads(resp)
+                if data.get('id') == self._cdp_id:
+                    return data
+            except Exception as e:
+                return {"error": f"WebSocket recv failed: {str(e)}", "ws_closed": True}
+
+    def _cdp_evaluate(self, ws, expression: str):
+        """Evaluate JavaScript trong browser"""
+        result = self._cdp_send(ws, "Runtime.evaluate", {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": True
+        })
+        return result.get('result', {}).get('result', {}).get('value')
+
+    def _is_ws_connected(self, ws) -> bool:
+        """Kiểm tra WebSocket còn kết nối không"""
+        if not ws:
+            return False
+        try:
+            result = self._cdp_send(ws, "Runtime.evaluate", {
+                "expression": "1+1",
+                "returnByValue": True
+            })
+            if result.get('ws_closed'):
+                return False
+            return result.get('result', {}).get('result', {}).get('value') == 2
+        except:
+            return False
+
+    def _is_browser_alive(self, cdp_base: str) -> bool:
+        """Kiểm tra browser còn chạy không"""
+        try:
+            resp = requests.get(f"{cdp_base}/json/version", timeout=3)
+            return resp.status_code == 200
+        except:
+            return False
+
+    def _get_or_create_ws(self, ws, cdp_base: str, target_url: str = None):
+        """Kiểm tra WS hiện tại, nếu không ok thì tạo tab mới"""
+        if self._is_ws_connected(ws):
+            return (ws, True)
+
+        print(f"[Reels] WebSocket mất kết nối, đang reconnect...")
+
+        if not self._is_browser_alive(cdp_base):
+            return (None, False)
+
+        try:
+            import websocket
+            resp = requests.get(f"{cdp_base}/json", timeout=10)
+            pages = resp.json()
+            for p in pages:
+                if p.get('type') == 'page':
+                    ws_url = p.get('webSocketDebuggerUrl')
+                    if ws_url:
+                        try:
+                            new_ws = websocket.create_connection(ws_url, timeout=30, suppress_origin=True)
+                            return (new_ws, True)
+                        except:
+                            pass
+        except:
+            pass
+
+        return (ws, False)
+
+    def _close_old_tabs(self, cdp_base: str):
+        """Đóng hết tab cũ, giữ lại 1 tab"""
+        try:
+            import websocket
+            resp = requests.get(f"{cdp_base}/json", timeout=10)
+            all_pages = resp.json()
+            page_targets = [p for p in all_pages if p.get('type') == 'page']
+
+            if len(page_targets) > 0:
+                first_tab_ws = page_targets[0].get('webSocketDebuggerUrl')
+                if first_tab_ws:
+                    try:
+                        temp_ws = websocket.create_connection(first_tab_ws, timeout=10, suppress_origin=True)
+                        temp_ws.send(json_module.dumps({
+                            "id": 1,
+                            "method": "Page.navigate",
+                            "params": {"url": "about:blank"}
+                        }))
+                        temp_ws.recv()
+                        temp_ws.close()
+                    except:
+                        pass
+
+                if len(page_targets) > 1:
+                    for p in page_targets[1:]:
+                        target_id = p.get('id')
+                        if target_id:
+                            requests.get(f"{cdp_base}/json/close/{target_id}", timeout=5)
+        except Exception as e:
+            print(f"[Reels] Lỗi đóng tab cũ: {e}")
+
+    def _scroll_page(self, ws, direction: str = "down", amount: int = None):
+        """Scroll trang như người thật"""
+        import random
+        if amount is None:
+            amount = random.randint(200, 500)
+        if direction == "up":
+            amount = -amount
+        self._cdp_evaluate(ws, f"window.scrollBy(0, {amount})")
+

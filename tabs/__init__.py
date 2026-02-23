@@ -10,6 +10,8 @@ from .content_page import ContentPage
 from .groups_page import GroupsPage
 from .scripts_page import ScriptsPage
 from .posts_page import PostsPage
+from .interaction_page import InteractionPage
+from .cdp_mixin import CDPMixin
 
 __all__ = [
     'LoginPage',
@@ -18,5 +20,7 @@ __all__ = [
     'ContentPage',
     'GroupsPage',
     'ScriptsPage',
-    'PostsPage'
+    'PostsPage',
+    'InteractionPage',
+    'CDPMixin'
 ]

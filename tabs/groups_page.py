@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QProgressBar, QTableWidgetItem, QSpinBox,
     QTabWidget, QScrollArea, QTextEdit, QFileDialog, QCheckBox
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QSettings
 from PySide6.QtGui import QColor
 
 from config import COLORS
@@ -63,6 +63,7 @@ class GroupsSignal(QObject):
     comment_progress = Signal(int, int)
     comment_complete = Signal()
     log_message = Signal(str, str)  # message, type
+    posted_log = Signal(str)  # posted URL log entry
 
 
 class GroupsPage(QWidget):
@@ -99,6 +100,14 @@ class GroupsPage(QWidget):
         self.posted_history: List[Dict] = []
         self.boost_posts: List[Dict] = []
 
+        # Pagination for boost tab
+        self._boost_page = 0
+        self._boost_page_size = 30
+        self._boost_total_count = 0
+
+        # CDP tracking
+        self._cdp_id = 0
+
         # Signal
         self.signal = GroupsSignal()
         self.signal.data_loaded.connect(self._on_data_loaded)
@@ -110,9 +119,14 @@ class GroupsPage(QWidget):
         self.signal.comment_progress.connect(self._on_comment_progress)
         self.signal.comment_complete.connect(self._on_comment_complete)
         self.signal.log_message.connect(lambda msg, t: self.log(msg, t))
+        self.signal.posted_log.connect(self._on_posted_log)
 
+        # Settings file
+        self._settings = QSettings("FBManagerPro", "GroupsPage")
+        
         self._setup_ui()
         QTimer.singleShot(500, self._load_data)
+        QTimer.singleShot(600, self._load_settings)  # Load settings after UI ready
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -123,7 +137,7 @@ class GroupsPage(QWidget):
         top_bar = QHBoxLayout()
         top_bar.setSpacing(12)
 
-        title = CyberTitle("Đăng Nhóm", "Quét, đăng bài và đẩy tin vào nhóm", "coral")
+        title = CyberTitle("ĐĂNG NHÓM", "", "coral")
         top_bar.addWidget(title)
 
         top_bar.addStretch()
@@ -395,6 +409,7 @@ class GroupsPage(QWidget):
 
         self.cat_combo = CyberComboBox(["Mặc định"])
         self.cat_combo.currentIndexChanged.connect(self._on_category_change)
+        self.cat_combo.currentIndexChanged.connect(lambda: self._save_settings())
         cat_row.addWidget(self.cat_combo)
 
         self.random_content_cb = CyberCheckBox()
@@ -479,12 +494,39 @@ class GroupsPage(QWidget):
         self.img_count_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 10px;")
         img_layout.addWidget(self.img_count_label)
 
+        # Image count row
+        img_count_row = QHBoxLayout()
+        img_num_label = QLabel("Số ảnh random:")
+        img_num_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px;")
+        img_count_row.addWidget(img_num_label)
+
+        self.img_count_spin = QSpinBox()
+        self.img_count_spin.setRange(1, 10)
+        self.img_count_spin.setValue(5)
+        self.img_count_spin.setFixedWidth(60)
+        self.img_count_spin.setStyleSheet(f"""
+            QSpinBox {{
+                background: {COLORS['bg_darker']};
+                color: {COLORS['text_primary']};
+                border: 2px solid {COLORS['border']};
+                border-radius: 6px;
+                padding: 4px;
+            }}
+        """)
+        img_count_row.addWidget(self.img_count_spin)
+        img_count_row.addStretch()
+
+        img_layout.addLayout(img_count_row)
+
         content_layout.addWidget(img_frame)
 
-        # Connect checkbox
+        # Connect checkbox và auto-save
         self.attach_img_cb.stateChanged.connect(
-            lambda s: self.img_folder_input.setEnabled(s == Qt.Checked)
+            lambda s: self.img_folder_input.setEnabled(s == Qt.CheckState.Checked or s == 2)
         )
+        self.attach_img_cb.stateChanged.connect(lambda: self._save_settings())
+        self.img_folder_input.textChanged.connect(lambda: self._save_settings())
+        self.img_count_spin.valueChanged.connect(lambda: self._save_settings())
 
         # Options
         options_frame = QFrame()
@@ -502,6 +544,26 @@ class GroupsPage(QWidget):
         options_title = QLabel("⚙️ Tùy chọn đăng")
         options_title.setStyleSheet(f"color: {COLORS['neon_yellow']}; font-size: 12px; font-weight: bold;")
         options_layout.addWidget(options_title)
+
+        # Auto Like row
+        like_row = QHBoxLayout()
+        self.auto_like_cb = CyberCheckBox()
+        like_row.addWidget(self.auto_like_cb)
+
+        like_label = QLabel("Tự động thích bài")
+        like_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px;")
+        like_row.addWidget(like_label)
+
+        like_type_label = QLabel("Loại:")
+        like_type_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px; margin-left: 15px;")
+        like_row.addWidget(like_type_label)
+
+        self.react_type_combo = CyberComboBox(["👍 Like", "❤️ Yêu thích", "😆 Haha", "😮 Wow", "😢 Buồn", "😡 Phẫn nộ"])
+        self.react_type_combo.setFixedWidth(130)
+        like_row.addWidget(self.react_type_combo)
+        like_row.addStretch()
+
+        options_layout.addLayout(like_row)
 
         delay_row = QHBoxLayout()
         delay_label = QLabel("Delay (giây):")
@@ -534,6 +596,11 @@ class GroupsPage(QWidget):
 
         delay_row.addStretch()
         options_layout.addLayout(delay_row)
+
+        # Connect auto-save cho options
+        self.delay_spin.valueChanged.connect(lambda: self._save_settings())
+        self.random_delay_cb.stateChanged.connect(lambda: self._save_settings())
+        self.random_content_cb.stateChanged.connect(lambda: self._save_settings())
 
         content_layout.addWidget(options_frame)
 
@@ -679,7 +746,6 @@ class GroupsPage(QWidget):
             QScrollArea {{
                 background: {COLORS['bg_darker']};
                 border: none;
-                border-radius: 0 0 14px 14px;
             }}
         """)
 
@@ -692,6 +758,33 @@ class GroupsPage(QWidget):
 
         scroll.setWidget(self.boost_list_widget)
         left_layout.addWidget(scroll, 1)
+
+        # Pagination
+        pagination_widget = QWidget()
+        pagination_widget.setFixedHeight(40)
+        pagination_widget.setStyleSheet(f"background: {COLORS['bg_darker']}; border-radius: 0 0 14px 14px;")
+        pagination_layout = QHBoxLayout(pagination_widget)
+        pagination_layout.setContentsMargins(12, 4, 12, 4)
+
+        self.btn_prev_page = CyberButton("< Trước", "ghost")
+        self.btn_prev_page.setFixedWidth(80)
+        self.btn_prev_page.clicked.connect(self._prev_boost_page)
+        pagination_layout.addWidget(self.btn_prev_page)
+
+        pagination_layout.addStretch()
+
+        self.page_label = QLabel("Trang 1/1")
+        self.page_label.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px;")
+        pagination_layout.addWidget(self.page_label)
+
+        pagination_layout.addStretch()
+
+        self.btn_next_page = CyberButton("Sau >", "ghost")
+        self.btn_next_page.setFixedWidth(80)
+        self.btn_next_page.clicked.connect(self._next_boost_page)
+        pagination_layout.addWidget(self.btn_next_page)
+
+        left_layout.addWidget(pagination_widget)
 
         layout.addWidget(left_card)
 
@@ -1326,10 +1419,11 @@ class GroupsPage(QWidget):
 
     def _filter_post_groups(self, text):
         """Filter post groups by text"""
-        text = text.lower()
+        text = text.lower().strip()
         for group in self.groups:
             group_id = group.get('id')
-            name = group.get('name', '').lower()
+            # Dùng cả group_name và name để filter
+            name = (group.get('group_name') or group.get('name', '')).lower()
             if group_id in self.post_group_checkboxes:
                 cb = self.post_group_checkboxes[group_id]
                 parent = cb.parent()
@@ -1337,7 +1431,7 @@ class GroupsPage(QWidget):
                     parent.setVisible(text in name or not text)
 
     def _toggle_select_all_post(self, state):
-        checked = state == Qt.Checked
+        checked = state == Qt.CheckState.Checked or state == 2
         for cb in self.post_group_checkboxes.values():
             cb.setChecked(checked)
         self._update_post_stats()
@@ -1586,22 +1680,60 @@ class GroupsPage(QWidget):
                 raise Exception("Không lấy được CDP port")
 
             cdp_base = f"http://127.0.0.1:{remote_port}"
+            self._posting_port = remote_port  # Lưu để dùng cho tab mới
             time.sleep(2)
 
-            # Lấy WebSocket
-            resp = requests.get(f"{cdp_base}/json", timeout=10)
-            tabs = resp.json()
+            # QUAN TRỌNG: Đóng hết tab cũ, giữ lại 1 tab về about:blank
+            self._close_old_tabs_and_prepare(cdp_base, profile_uuid)
+            time.sleep(1)
 
+            # Lấy WebSocket với retry
             page_ws = None
-            for tab in tabs:
-                if tab.get('type') == 'page':
-                    page_ws = tab.get('webSocketDebuggerUrl')
-                    break
+            for attempt in range(5):
+                try:
+                    resp = requests.get(f"{cdp_base}/json", timeout=10)
+                    pages = resp.json()
+                    for p in pages:
+                        if p.get('type') == 'page':
+                            page_ws = p.get('webSocketDebuggerUrl')
+                            break
+                    if page_ws:
+                        break
+                except Exception as e:
+                    print(f"[WARN] CDP attempt {attempt + 1}/5 failed: {e}")
+                    if attempt == 2:
+                        # Browser có thể đã đóng, thử mở lại
+                        print(f"[INFO] Browser có thể đã đóng, thử mở lại...")
+                        result = api.open_browser(profile_uuid)
+                        if result.get('type') != 'error':
+                            data = result.get('data', {})
+                            new_port = data.get('remote_port')
+                            if new_port:
+                                remote_port = new_port
+                                cdp_base = f"http://127.0.0.1:{remote_port}"
+                                self._posting_port = remote_port
+                                print(f"[INFO] Đã mở lại browser, port: {remote_port}")
+                    time.sleep(1)
 
             if not page_ws:
                 raise Exception("Không tìm thấy WebSocket")
 
-            ws = websocket.create_connection(page_ws, timeout=30, suppress_origin=True)
+            # Kết nối WebSocket
+            ws = None
+            try:
+                ws = websocket.create_connection(page_ws, timeout=30, suppress_origin=True)
+            except:
+                try:
+                    ws = websocket.create_connection(page_ws, timeout=30, origin=f"http://127.0.0.1:{remote_port}")
+                except:
+                    try:
+                        ws = websocket.create_connection(page_ws, timeout=30)
+                    except Exception as e:
+                        raise Exception(f"WebSocket error: {e}")
+
+            if not ws:
+                raise Exception("Không kết nối được WebSocket")
+
             msg_id = [10]
 
             def send_cdp(method, params=None):
@@ -1622,18 +1754,141 @@ class GroupsPage(QWidget):
                 group_id = group.get('group_id', '')
                 self.signal.log_message.emit(f"[{completed_offset + i + 1}/{total_groups}] Đăng vào: {group_name[:30]}", "info")
 
-                # Navigate đến nhóm
-                group_url = f"https://www.facebook.com/groups/{group_id}"
-                send_cdp("Page.navigate", {"url": group_url})
-                time.sleep(random.uniform(4, 6))
+                # QUAN TRỌNG: Kiểm tra và reconnect WS nếu cần
+                ws, ws_ok = self._get_or_create_ws(ws, cdp_base, "about:blank")
+                if not ws_ok:
+                    self.signal.log_message.emit(f"Lỗi WebSocket, bỏ qua nhóm này", "error")
+                    continue
 
-                # Đợi page load
-                for _ in range(10):
-                    result = send_cdp("Runtime.evaluate", {"expression": "document.readyState"})
-                    if result.get('result', {}).get('result', {}).get('value') == 'complete':
-                        break
-                    time.sleep(1)
+                # Lưu ID tab cũ để đóng sau
+                old_target_id = None
+                try:
+                    resp = requests.get(f"{cdp_base}/json", timeout=10)
+                    pages = resp.json()
+                    for p in pages:
+                        if p.get('type') == 'page':
+                            old_target_id = p.get('id')
+                            break
+                except:
+                    pass
+
+                # Tạo tab MỚI với group URL (tránh leave site dialog)
+                group_url = f"https://www.facebook.com/groups/{group_id}"
+                target_id = None
+                new_ws = None
+
+                for attempt in range(3):
+                    try:
+                        # Thử tạo tab mới qua CDP
+                        msg_id[0] += 1
+                        ws.send(json_module.dumps({
+                            "id": msg_id[0],
+                            "method": "Target.createTarget",
+                            "params": {"url": group_url}
+                        }))
+                        result = json_module.loads(ws.recv())
+                        target_id = result.get('result', {}).get('targetId')
+
+                        if target_id:
+                            time.sleep(random.uniform(2, 3))
+
+                            # Lấy WebSocket của tab mới
+                            new_ws_url = None
+                            resp = requests.get(f"{cdp_base}/json", timeout=10)
+                            pages = resp.json()
+                            for p in pages:
+                                if p.get('id') == target_id:
+                                    new_ws_url = p.get('webSocketDebuggerUrl')
+                                    break
+                            # Fallback: tìm theo URL
+                            if not new_ws_url:
+                                for p in pages:
+                                    if p.get('type') == 'page' and group_id in p.get('url', '') and p.get('id') != old_target_id:
+                                        new_ws_url = p.get('webSocketDebuggerUrl')
+                                        target_id = p.get('id')
+                                        break
+
+                            if new_ws_url:
+                                try:
+                                    new_ws = websocket.create_connection(new_ws_url, timeout=30, suppress_origin=True)
+                                except:
+                                    new_ws = websocket.create_connection(new_ws_url, timeout=30)
+
+                                if new_ws:
+                                    print(f"[INFO] Tạo tab mới thành công (attempt {attempt + 1})")
+                                    break
+                    except Exception as e:
+                        print(f"[WARN] Attempt {attempt + 1}/3 tạo tab thất bại: {e}")
+                        time.sleep(1)
+
+                # Nếu không tạo được tab mới, thử FALLBACK: navigate trên tab hiện tại
+                if not new_ws:
+                    print(f"[WARN] Không tạo được tab mới, thử navigate trên tab hiện tại...")
+                    try:
+                        send_cdp("Page.handleJavaScriptDialog", {"accept": True})
+                    except:
+                        pass
+                    try:
+                        send_cdp("Page.navigate", {"url": group_url})
+                        time.sleep(random.uniform(3, 4))
+                        new_ws = ws
+                        target_id = old_target_id
+                        old_target_id = None  # Không đóng tab vì đang dùng
+                        print(f"[INFO] Fallback navigate thành công")
+                    except Exception as e:
+                        self.signal.log_message.emit(f"Lỗi navigate: {e}", "error")
+                        continue
+
+                # Đóng WebSocket cũ TRƯỚC (nếu đã tạo tab mới)
+                if new_ws != ws:
+                    try:
+                        ws.close()
+                    except:
+                        pass
+
+                # Đóng tab CŨ bằng ID đã lưu
+                if old_target_id and old_target_id != target_id:
+                    try:
+                        requests.get(f"{cdp_base}/json/close/{old_target_id}", timeout=5)
+                        print(f"[INFO] Đã đóng tab cũ")
+                    except:
+                        pass
+
+                # Từ giờ dùng new_ws
+                ws = new_ws
                 time.sleep(random.uniform(1, 2))
+
+                # Đợi page load xong với retry
+                page_loaded = False
+                for _ in range(15):
+                    try:
+                        msg_id[0] += 1
+                        ws.send(json_module.dumps({
+                            "id": msg_id[0],
+                            "method": "Runtime.evaluate",
+                            "params": {"expression": "document.readyState", "returnByValue": True}
+                        }))
+                        result = json_module.loads(ws.recv())
+                        if result.get('result', {}).get('result', {}).get('value') == 'complete':
+                            page_loaded = True
+                            break
+                    except:
+                        ws, _ = self._get_or_create_ws(ws, cdp_base, group_url)
+                    time.sleep(1)
+
+                if not page_loaded:
+                    print(f"[WARN] Page không load được, thử tiếp...")
+
+                time.sleep(random.uniform(1, 2))
+
+                # Cập nhật send_cdp để dùng ws mới
+                def send_cdp(method, params=None):
+                    msg_id[0] += 1
+                    msg = {"id": msg_id[0], "method": method}
+                    if params:
+                        msg["params"] = params
+                    ws.send(json_module.dumps(msg))
+                    return json_module.loads(ws.recv())
 
                 # Scroll xuống một chút như người thật đọc trang
                 if random.random() < 0.7:
@@ -1649,19 +1904,23 @@ class GroupsPage(QWidget):
                 else:
                     post_text = content_to_post
 
-                # Click vào ô "Bạn viết gì đi..." - PHÂN BIỆT COMPOSER TẠO BÀI vs Ô COMMENT
-                click_composer_script = '''
+                # ===== BƯỚC 2: Click vào "Bạn viết gì đi..." với mouse movement =====
+                # Tìm vị trí composer button với RETRY - PHÂN BIỆT COMPOSER TẠO BÀI vs Ô COMMENT
+                get_composer_pos_js = '''
                 (function() {
                     const composerTexts = ['Bạn viết gì đi', 'Write something', 'bạn viết gì đi', 'write something'];
-
-                    function hasComposerText(text) {
-                        if (!text) return false;
-                        let lowerText = text.toLowerCase();
-                        for (let kw of composerTexts) {
-                            if (lowerText.includes(kw.toLowerCase())) return true;
-                        }
-                        return false;
-                    }
+                    const mainComposerIndicators = [
+                        'Bài viết ẩn danh', 'Anonymous post',
+                        'Thăm dò ý kiến', 'Poll',
+                        'Cảm xúc/hoạt động', 'Feeling/activity',
+                        'Trang cá nhân', 'Ảnh/video', 'Photo/video'
+                    ];
+                    
+                    // Loại trừ comment box
+                    const commentKeywords = [
+                        'viết bình luận', 'write a comment', 'viết phản hồi',
+                        'write a reply', 'bình luận công khai', 'public comment'
+                    ];
 
                     function isInsideArticle(el) {
                         let parent = el;
@@ -1673,16 +1932,65 @@ class GroupsPage(QWidget):
                         }
                         return false;
                     }
+                    
+                    function isCommentButton(el) {
+                        let text = (el.innerText || '').toLowerCase();
+                        let ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+                        let combined = text + ' ' + ariaLabel;
+                        for (let kw of commentKeywords) {
+                            if (combined.includes(kw)) return true;
+                        }
+                        return false;
+                    }
+
+                    function hasComposerText(text) {
+                        if (!text) return false;
+                        let lowerText = text.toLowerCase();
+                        for (let kw of composerTexts) {
+                            if (lowerText.includes(kw.toLowerCase())) return true;
+                        }
+                        return false;
+                    }
+
+                    function isMainComposer(el) {
+                        let container = el;
+                        for (let i = 0; i < 8; i++) {
+                            if (!container.parentElement) break;
+                            container = container.parentElement;
+                            let text = container.innerText || '';
+                            for (let indicator of mainComposerIndicators) {
+                                if (text.includes(indicator)) {
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    }
+
+                    function getCoords(el) {
+                        let rect = el.getBoundingClientRect();
+                        if (rect.top > 0 && rect.top < 700 && rect.width > 50 && rect.height > 10) {
+                            return {
+                                x: rect.left + rect.width / 2 + (Math.random() * 20 - 10),
+                                y: rect.top + rect.height / 2 + (Math.random() * 6 - 3),
+                                top: rect.top
+                            };
+                        }
+                        return null;
+                    }
+
+                    let candidates = [];
 
                     // Cách 1: Tìm [role="button"][tabindex="0"] với text composer
                     let btns = document.querySelectorAll('[role="button"][tabindex="0"]');
                     for (let btn of btns) {
                         let text = btn.innerText || '';
-                        if (hasComposerText(text) && !isInsideArticle(btn)) {
-                            let rect = btn.getBoundingClientRect();
-                            if (rect.top > 0 && rect.top < 700 && rect.width > 50) {
-                                btn.click();
-                                return {x: rect.left + rect.width/2, y: rect.top + rect.height/2, clicked: true};
+                        if (hasComposerText(text) && !isInsideArticle(btn) && !isCommentButton(btn)) {
+                            if (isMainComposer(btn)) {
+                                let coords = getCoords(btn);
+                                if (coords) {
+                                    candidates.push({...coords, method: 'role+tabindex', priority: 1});
+                                }
                             }
                         }
                     }
@@ -1691,11 +1999,13 @@ class GroupsPage(QWidget):
                     let allBtns = document.querySelectorAll('[role="button"]');
                     for (let btn of allBtns) {
                         let text = btn.innerText || '';
-                        if (hasComposerText(text) && !isInsideArticle(btn)) {
-                            let rect = btn.getBoundingClientRect();
-                            if (rect.top > 0 && rect.top < 700) {
-                                btn.click();
-                                return {x: rect.left + rect.width/2, y: rect.top + rect.height/2, clicked: true};
+                        if (hasComposerText(text) && !isInsideArticle(btn) && !isCommentButton(btn) && isMainComposer(btn)) {
+                            let coords = getCoords(btn);
+                            if (coords) {
+                                let isDup = candidates.some(c => Math.abs(c.top - coords.top) < 10);
+                                if (!isDup) {
+                                    candidates.push({...coords, method: 'role=button', priority: 2});
+                                }
                             }
                         }
                     }
@@ -1704,108 +2014,536 @@ class GroupsPage(QWidget):
                     let divs = document.querySelectorAll('div[tabindex="0"]');
                     for (let div of divs) {
                         let text = div.innerText || '';
-                        if (hasComposerText(text) && !isInsideArticle(div)) {
-                            let rect = div.getBoundingClientRect();
-                            if (rect.top > 0 && rect.top < 700) {
-                                div.click();
-                                return {x: rect.left + rect.width/2, y: rect.top + rect.height/2, clicked: true};
+                        if (hasComposerText(text) && !isInsideArticle(div) && !isCommentButton(div)) {
+                            let coords = getCoords(div);
+                            if (coords) {
+                                let isDup = candidates.some(c => Math.abs(c.top - coords.top) < 10);
+                                if (!isDup) {
+                                    candidates.push({...coords, method: 'div+tabindex', priority: 3});
+                                }
                             }
                         }
                     }
 
-                    // Cách 4: Tìm theo aria-label
+                    // Cách 4: Tìm span chứa text rồi lên parent clickable
+                    let spans = document.querySelectorAll('span');
+                    for (let span of spans) {
+                        let text = span.innerText || '';
+                        if (hasComposerText(text)) {
+                            let parent = span.closest('[role="button"], [tabindex="0"]');
+                            if (parent && !isInsideArticle(parent) && !isCommentButton(parent) && isMainComposer(parent)) {
+                                let coords = getCoords(parent);
+                                if (coords) {
+                                    let isDup = candidates.some(c => Math.abs(c.top - coords.top) < 10);
+                                    if (!isDup) {
+                                        candidates.push({...coords, method: 'span->parent', priority: 4});
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Cách 5: Tìm theo aria-label
                     let labeled = document.querySelectorAll('[aria-label*="Create a post"], [aria-label*="Tạo bài viết"], [aria-label*="Viết bài"]');
                     for (let el of labeled) {
-                        if (!isInsideArticle(el)) {
-                            let rect = el.getBoundingClientRect();
-                            if (rect.top > 0 && rect.top < 700) {
-                                el.click();
-                                return {x: rect.left + rect.width/2, y: rect.top + rect.height/2, clicked: true};
+                        if (!isInsideArticle(el) && !isCommentButton(el)) {
+                            let coords = getCoords(el);
+                            if (coords) {
+                                let isDup = candidates.some(c => Math.abs(c.top - coords.top) < 10);
+                                if (!isDup) {
+                                    candidates.push({...coords, method: 'aria-label', priority: 5});
+                                }
                             }
                         }
                     }
 
-                    return {clicked: false};
+                    if (candidates.length === 0) {
+                        return null;
+                    }
+
+                    // Sắp xếp theo priority và top
+                    candidates.sort((a, b) => {
+                        if (a.priority !== b.priority) return a.priority - b.priority;
+                        return a.top - b.top;
+                    });
+
+                    let best = candidates[0];
+                    return {x: best.x, y: best.y};
                 })()
                 '''
-                result = send_cdp("Runtime.evaluate", {"expression": click_composer_script, "returnByValue": True})
-                time.sleep(random.uniform(2, 3))
 
-                # Đợi editor xuất hiện
-                for _ in range(5):
-                    check_result = send_cdp("Runtime.evaluate", {
-                        "expression": "document.querySelector('[contenteditable=\"true\"][role=\"textbox\"]') !== null",
-                        "returnByValue": True
-                    })
-                    if check_result.get('result', {}).get('result', {}).get('value'):
+                composer_pos = None
+                for attempt in range(3):
+                    composer_pos = self._cdp_evaluate(ws, get_composer_pos_js)
+                    if composer_pos:
                         break
+                    print(f"[WARN] Không tìm thấy composer (attempt {attempt + 1}/3), thử scroll và reload...")
+                    self._cdp_evaluate(ws, "window.scrollTo(0, 0)")
                     time.sleep(1)
+                    if attempt == 1:
+                        self._cdp_send(ws, "Page.reload", {})
+                        time.sleep(random.uniform(3, 4))
 
-                # Focus vào editor
-                send_cdp("Runtime.evaluate", {
-                    "expression": """
-                    (function() {
-                        var editor = document.querySelector('[contenteditable="true"][role="textbox"]');
-                        if (editor) {
-                            editor.focus();
-                            editor.click();
-                            return true;
+                if not composer_pos:
+                    print(f"[WARN] Không tìm thấy nút tạo bài trong group {group_id} sau 3 lần thử")
+                    return (False, "", ws)
+
+                # Di chuyển chuột đến composer và click
+                self._move_mouse_human(ws, int(composer_pos['x']), int(composer_pos['y']))
+                time.sleep(random.uniform(0.1, 0.3))
+
+                # Click với mouse events
+                self._cdp_send(ws, "Input.dispatchMouseEvent", {
+                    "type": "mousePressed",
+                    "x": int(composer_pos['x']),
+                    "y": int(composer_pos['y']),
+                    "button": "left",
+                    "clickCount": 1
+                })
+                time.sleep(random.uniform(0.05, 0.12))
+                self._cdp_send(ws, "Input.dispatchMouseEvent", {
+                    "type": "mouseReleased",
+                    "x": int(composer_pos['x']),
+                    "y": int(composer_pos['y']),
+                    "button": "left",
+                    "clickCount": 1
+                })
+
+                time.sleep(random.uniform(2, 3))  # Đợi popup mở
+
+                # ===== BƯỚC 3: Focus vào textarea với RETRY =====
+                # Logic chặt chẽ: PHẢI là main composer, KHÔNG PHẢI comment box
+                focus_textarea_js = '''
+                (function() {
+                    // Các từ khóa của COMMENT BOX (cần loại trừ)
+                    const commentKeywords = [
+                        'viết bình luận', 'write a comment', 'viết phản hồi', 
+                        'write a reply', 'bình luận', 'comment', 'reply',
+                        'trả lời', 'phản hồi'
+                    ];
+                    
+                    // Các từ khóa của MAIN COMPOSER (cần tìm)
+                    const composerKeywords = [
+                        'nghĩ gì', 'on your mind', 'viết gì đi', 'write something',
+                        'tạo bài viết', 'create a post', 'create post'
+                    ];
+                    
+                    function isInsideArticle(el) {
+                        let parent = el;
+                        while (parent) {
+                            if (parent.getAttribute && parent.getAttribute('role') === 'article') {
+                                return true;
+                            }
+                            // Kiểm tra thêm: nếu nằm trong phần comments
+                            if (parent.getAttribute && parent.getAttribute('aria-label') && 
+                                parent.getAttribute('aria-label').toLowerCase().includes('comment')) {
+                                return true;
+                            }
+                            parent = parent.parentElement;
                         }
                         return false;
-                    })()
-                    """
-                })
-                time.sleep(0.5)
+                    }
+                    
+                    function isCommentBox(el) {
+                        let ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+                        let placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
+                        let dataPlaceholder = (el.getAttribute('data-placeholder') || '').toLowerCase();
+                        let textToCheck = ariaLabel + ' ' + placeholder + ' ' + dataPlaceholder;
+                        
+                        for (let kw of commentKeywords) {
+                            if (textToCheck.includes(kw)) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                    
+                    function isMainComposer(el) {
+                        let ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+                        let placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
+                        let dataPlaceholder = (el.getAttribute('data-placeholder') || '').toLowerCase();
+                        let textToCheck = ariaLabel + ' ' + placeholder + ' ' + dataPlaceholder;
+                        
+                        // Nếu không có label => có thể là composer chính (popup)
+                        if (!ariaLabel && !placeholder && !dataPlaceholder) {
+                            return true;
+                        }
+                        
+                        for (let kw of composerKeywords) {
+                            if (textToCheck.includes(kw)) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                    
+                    let editors = document.querySelectorAll('[contenteditable="true"]');
+                    let candidates = [];
+                    
+                    for (let i = 0; i < editors.length; i++) {
+                        let ed = editors[i];
+                        let rect = ed.getBoundingClientRect();
+                        
+                        // Bỏ qua nếu không visible hoặc quá nhỏ
+                        if (rect.width < 100 || rect.height < 20) continue;
+                        
+                        // Bỏ qua nếu nằm trong article (bài viết cũ)
+                        if (isInsideArticle(ed)) {
+                            console.log('[SKIP] Editor inside article');
+                            continue;
+                        }
+                        
+                        // Bỏ qua nếu là comment box
+                        if (isCommentBox(ed)) {
+                            console.log('[SKIP] Editor is comment box');
+                            continue;
+                        }
+                        
+                        // Ưu tiên nếu là main composer
+                        let priority = isMainComposer(ed) ? 1 : 2;
+                        
+                        candidates.push({
+                            editor: ed,
+                            priority: priority,
+                            top: rect.top
+                        });
+                    }
+                    
+                    if (candidates.length === 0) {
+                        console.log('[ERROR] No valid editor found');
+                        return false;
+                    }
+                    
+                    // Sắp xếp: priority thấp hơn (main composer) trước
+                    candidates.sort((a, b) => {
+                        if (a.priority !== b.priority) return a.priority - b.priority;
+                        return a.top - b.top;
+                    });
+                    
+                    let best = candidates[0];
+                    console.log('[FOCUS] Focusing best editor, priority=' + best.priority);
+                    best.editor.focus();
+                    return true;
+                })()
+                '''
 
-                # Gõ nội dung như người thật
-                use_human_typing = random.random() < 0.6  # 60% dùng human typing
-                if use_human_typing and len(post_text) < 500:
-                    self.signal.log_message.emit("Đang gõ nội dung...", "info")
-                    self._type_like_human(ws, post_text, msg_id)
-                else:
-                    # Dùng insertText nhanh hơn cho text dài
-                    type_script = f"""
-                    (function() {{
-                        var editor = document.querySelector('[contenteditable="true"][role="textbox"]');
-                        if (editor) {{
-                            editor.focus();
-                            document.execCommand('insertText', false, {json_module.dumps(post_text)});
-                            return 'typed';
-                        }}
-                        return 'no_editor';
-                    }})()
-                    """
-                    send_cdp("Runtime.evaluate", {"expression": type_script})
+                focused = False
+                for attempt in range(3):
+                    focused = self._cdp_evaluate(ws, focus_textarea_js)
+                    if focused:
+                        break
+                    print(f"[WARN] Không focus được textarea (attempt {attempt + 1}/3), thử click lại composer...")
+                    if composer_pos:
+                        self._cdp_send(ws, "Input.dispatchMouseEvent", {
+                            "type": "mousePressed", "x": int(composer_pos['x']), "y": int(composer_pos['y']),
+                            "button": "left", "clickCount": 1
+                        })
+                        self._cdp_send(ws, "Input.dispatchMouseEvent", {
+                            "type": "mouseReleased", "x": int(composer_pos['x']), "y": int(composer_pos['y']),
+                            "button": "left"
+                        })
+                        time.sleep(random.uniform(1, 2))
+
+                if not focused:
+                    print(f"[WARN] Không focus được textarea trong group {group_id} sau 3 lần thử")
+                    return (False, "", ws)
+
+                time.sleep(random.uniform(0.5, 1))
+
+                # ===== BƯỚC 4: Gõ nội dung từng ký tự =====
+                typing_success = self._type_like_human(ws, post_text, msg_id)
+                if not typing_success:
+                    print(f"[ERROR] WebSocket đóng trong khi gõ nội dung cho group {group_id}")
+                    cdp_base = f"http://127.0.0.1:{self._thread_local.posting_port}"
+                    ws, reconnected = self._get_or_create_ws(ws, cdp_base, group_url)
+                    if not reconnected:
+                        print(f"[ERROR] Không thể reconnect, browser có thể đã đóng")
+                        return (False, "", None)
+                    return (False, "", ws)
                 time.sleep(random.uniform(1, 2))
 
-                # Click nút Đăng
-                post_script = """
+                # ===== BƯỚC 5: Upload ảnh nếu có =====
+                images = []
+                
+                # Ưu tiên ảnh từ schedule (nếu có)
+                if hasattr(self, '_schedule_images') and self._schedule_images:
+                    images = self._schedule_images
+                    self._schedule_images = []  # Reset sau khi dùng
+                    self.signal.log_message.emit(f"[IMG] Dùng {len(images)} ảnh từ schedule", "info")
+                else:
+                    # Lấy từ UI như bình thường
+                    has_attach_cb = hasattr(self, 'attach_img_cb')
+                    is_checked = self.attach_img_cb.isChecked() if has_attach_cb else False
+                    img_folder = self.img_folder_input.text().strip() if hasattr(self, 'img_folder_input') else ""
+                    self.signal.log_message.emit(f"[IMG] Check: cb={is_checked}, folder='{img_folder[:30] if img_folder else 'N/A'}'", "info")
+                    
+                    if is_checked and img_folder:
+                        img_count = self.img_count_spin.value() if hasattr(self, 'img_count_spin') else 5
+                        images = self._get_random_images(img_folder, img_count)
+                        self.signal.log_message.emit(f"[IMG] Found {len(images)} images in folder", "info")
+
+                if images:
+                    self.signal.log_message.emit(f"Đang upload {len(images)} ảnh...", "info")
+                    
+                    # Dùng absolute path - giữ nguyên backslash cho Windows CDP
+                    images_normalized = [os.path.abspath(img_path) for img_path in images]
+                    
+                    self.signal.log_message.emit(f"[IMG] Files: {[os.path.basename(p) for p in images_normalized]}", "info")
+                    
+                    # Bật chế độ intercept file chooser để ngăn dialog mở
+                    self._cdp_send(ws, "Page.setInterceptFileChooserDialog", {"enabled": True})
+                    
+                    # Get document để tìm input[type="file"]
+                    doc_result = self._cdp_send(ws, "DOM.getDocument", {})
+                    root_id = doc_result.get('result', {}).get('root', {}).get('nodeId', 0)
+
+                    uploaded = False
+                    if root_id:
+                        # Tìm tất cả input[type="file"]
+                        query_result = self._cdp_send(ws, "DOM.querySelectorAll", {
+                            "nodeId": root_id,
+                            "selector": 'input[type="file"]'
+                        })
+                        node_ids = query_result.get('result', {}).get('nodeIds', [])
+                        self.signal.log_message.emit(f"[IMG] Found {len(node_ids)} file inputs", "info")
+
+                        # Thử từng input cho đến khi upload được
+                        for node_id in node_ids:
+                            if uploaded:
+                                break
+                            if not node_id or node_id == 0:
+                                continue
+                            try:
+                                # Set tất cả files một lần - KHÔNG mở dialog
+                                set_result = self._cdp_send(ws, "DOM.setFileInputFiles", {
+                                    "nodeId": node_id,
+                                    "files": images_normalized
+                                })
+                                error_msg = set_result.get('error', {}).get('message', '')
+                                if error_msg:
+                                    self.signal.log_message.emit(f"[IMG] Node {node_id} error: {error_msg}", "warning")
+                                    continue
+                                    
+                                self.signal.log_message.emit(f"[IMG] Set files to node {node_id}", "info")
+                                time.sleep(2)  # Đợi upload
+
+                                # Kiểm tra xem có preview ảnh không
+                                preview_count = self._cdp_evaluate(ws, '''
+                                (function() {
+                                    let imgs = document.querySelectorAll('img[src*="blob:"]');
+                                    return imgs.length;
+                                })()
+                                ''')
+                                self.signal.log_message.emit(f"[IMG] Preview images: {preview_count}", "info")
+                                
+                                if preview_count and preview_count > 0:
+                                    uploaded = True
+                                    self.signal.log_message.emit(f"✓ Đã upload {len(images)} ảnh thành công!", "success")
+                            except Exception as e:
+                                self.signal.log_message.emit(f"[IMG] Node {node_id} exception: {e}", "warning")
+                                continue
+                    
+                    # Tắt intercept
+                    self._cdp_send(ws, "Page.setInterceptFileChooserDialog", {"enabled": False})
+
+                    if not uploaded:
+                        self.signal.log_message.emit("⚠ Không upload được ảnh, tiếp tục đăng text", "warning")
+
+                    # Đợi upload hoàn tất
+                    if uploaded:
+                        time.sleep(random.uniform(3, 5))  # Đợi ảnh upload xong
+                    else:
+                        time.sleep(random.uniform(1, 2))
+
+                # ===== BƯỚC 6: Click nút Đăng với mouse movement và RETRY =====
+                get_post_btn_pos_js = '''
                 (function() {
-                    // Tìm nút Đăng trong dialog/popup
-                    var btns = document.querySelectorAll('[aria-label*="Đăng"], [aria-label*="Post"], button, [role="button"]');
-                    for (var btn of btns) {
-                        var text = btn.textContent || btn.getAttribute('aria-label') || '';
-                        var rect = btn.getBoundingClientRect();
-                        // Nút Đăng thường ở góc dưới/phải của popup
-                        if ((text.trim() === 'Đăng' || text.trim() === 'Post') && rect.width > 30) {
-                            btn.click();
-                            return 'posted';
+                    const postTexts = ['Đăng', 'Post', 'Đăng bài', 'Submit'];
+                    const postAriaLabels = ['Đăng', 'Post', 'Đăng bài', 'Submit post', 'Submit'];
+
+                    function getCoords(btn) {
+                        let rect = btn.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0 && rect.top > 0) {
+                            return {
+                                x: rect.left + rect.width / 2 + (Math.random() * 10 - 5),
+                                y: rect.top + rect.height / 2 + (Math.random() * 4 - 2),
+                                disabled: btn.disabled || btn.getAttribute('aria-disabled') === 'true'
+                            };
+                        }
+                        return null;
+                    }
+
+                    // Tìm trong dialog/form tạo bài viết trước
+                    let dialogs = document.querySelectorAll('[role="dialog"], [data-pagelet*="ComposerPage"], form[method="post"]');
+                    for (let dialog of dialogs) {
+                        // Tìm nút trong dialog
+                        let btns = dialog.querySelectorAll('[role="button"]');
+                        for (let btn of btns) {
+                            let text = (btn.innerText || '').trim();
+                            // Chỉ match text CHÍNH XÁC, không phải substring
+                            if (postTexts.includes(text)) {
+                                let coords = getCoords(btn);
+                                if (coords) {
+                                    console.log('[PostBtn] Found in dialog:', text);
+                                    return coords;
+                                }
+                            }
+                        }
+                        
+                        // Cách 2: Tìm theo aria-label trong dialog
+                        for (let label of postAriaLabels) {
+                            let btn = dialog.querySelector('[aria-label="' + label + '"]');
+                            if (btn) {
+                                let coords = getCoords(btn);
+                                if (coords) {
+                                    console.log('[PostBtn] Found by aria-label in dialog:', label);
+                                    return coords;
+                                }
+                            }
                         }
                     }
-                    // Fallback: tìm nút có text chứa Đăng/Post
-                    for (var btn of btns) {
-                        var text = btn.textContent || '';
-                        if (text.includes('Đăng') || text.includes('Post')) {
-                            btn.click();
-                            return 'posted_fallback';
+
+                    // Fallback: Tìm ngoài dialog nhưng ưu tiên nút ở vị trí cao (trong form)
+                    // KHÔNG lấy nút có vị trí thấp (có thể là comment button)
+                    let candidates = [];
+                    let btns = document.querySelectorAll('[role="button"]');
+                    for (let btn of btns) {
+                        let text = (btn.innerText || '').trim();
+                        if (postTexts.includes(text)) {
+                            let rect = btn.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0 && rect.top > 0) {
+                                // Bỏ qua nếu nút nằm trong comment section
+                                let isInComment = btn.closest('[aria-label*="Write a comment"], [aria-label*="Viết bình luận"], [data-testid*="comment"]');
+                                if (!isInComment) {
+                                    candidates.push({btn: btn, top: rect.top});
+                                }
+                            }
                         }
                     }
-                    return 'no_button';
+                    
+                    // Sắp xếp theo vị trí top (cao nhất = đầu tiên) để tránh lấy nút comment ở dưới
+                    candidates.sort((a, b) => a.top - b.top);
+                    
+                    if (candidates.length > 0) {
+                        let best = candidates[0];
+                        let rect = best.btn.getBoundingClientRect();
+                        console.log('[PostBtn] Found best candidate at top:', best.top);
+                        return {
+                            x: rect.left + rect.width / 2 + (Math.random() * 10 - 5),
+                            y: rect.top + rect.height / 2 + (Math.random() * 4 - 2),
+                            disabled: best.btn.disabled || best.btn.getAttribute('aria-disabled') === 'true'
+                        };
+                    }
+
+                    // Cách cuối: Tìm button có text Đăng/Post trong span
+                    let spans = document.querySelectorAll('span');
+                    for (let span of spans) {
+                        let text = (span.innerText || '').trim();
+                        if (postTexts.includes(text)) {
+                            let btn = span.closest('[role="button"]');
+                            if (btn) {
+                                // Kiểm tra không phải trong comment
+                                let isInComment = btn.closest('[aria-label*="Write a comment"], [aria-label*="Viết bình luận"]');
+                                if (!isInComment) {
+                                    let coords = getCoords(btn);
+                                    if (coords) return coords;
+                                }
+                            }
+                        }
+                    }
+
+                    // Cách cuối cùng: Tìm form submit button
+                    let submitBtns = document.querySelectorAll('button[type="submit"], input[type="submit"]');
+                    for (let btn of submitBtns) {
+                        let coords = getCoords(btn);
+                        if (coords) return coords;
+                    }
+
+                    return null;
                 })()
-                """
-                send_cdp("Runtime.evaluate", {"expression": post_script})
-                time.sleep(random.uniform(2, 4))  # Đợi đăng xong
-                self.signal.log_message.emit(f"✓ Đã đăng vào {group_name[:25]}", "success")
+                '''
+
+                post_btn_pos = None
+                for attempt in range(3):
+                    post_btn_pos = self._cdp_evaluate(ws, get_post_btn_pos_js)
+                    if post_btn_pos:
+                        break
+                    print(f"[WARN] Không tìm thấy nút Đăng (attempt {attempt + 1}/3), đợi thêm...")
+                    time.sleep(1)
+
+                if not post_btn_pos:
+                    print(f"[WARN] Không tìm thấy nút Đăng trong group {group_id} sau 3 lần thử")
+                    return (False, "", ws)
+
+                # *** LƯU DANH SÁCH POST IDs TRƯỚC KHI ĐĂNG (chỉ của group này) ***
+                get_existing_ids_js = f'''
+                (function() {{
+                    let groupId = '{group_id}';
+                    let ids = [];
+                    
+                    // Chỉ lấy links của group này
+                    let links = document.querySelectorAll('a[href*="/groups/"][href*="/posts/"]');
+                    for (let link of links) {{
+                        if (link.href.includes(groupId) || link.href.includes('/groups/{group_id}/')) {{
+                            let match = link.href.match(/\\/posts\\/(\\d+)/);
+                            if (match && match[1]) {{
+                                ids.push(match[1]);
+                            }}
+                        }}
+                    }}
+                    
+                    // Thêm pcb IDs
+                    let pcbLinks = document.querySelectorAll('a[href*="set=pcb."]');
+                    for (let link of pcbLinks) {{
+                        let match = link.href.match(/set=pcb\\.(\\d+)/);
+                        if (match && match[1]) {{
+                            ids.push(match[1]);
+                        }}
+                    }}
+                    return JSON.stringify([...new Set(ids)]);
+                }})()
+                '''
+                existing_ids_json = self._cdp_evaluate(ws, get_existing_ids_js)
+                existing_ids = json_module.loads(existing_ids_json) if existing_ids_json else []
+                print(f"[Groups] Post IDs TRƯỚC khi đăng: {len(existing_ids)} IDs")
+
+                # Di chuyển chuột đến nút Đăng
+                self._move_mouse_human(ws, int(post_btn_pos['x']), int(post_btn_pos['y']))
+                time.sleep(random.uniform(0.15, 0.4))
+
+                # Click với mouse events
+                self._cdp_send(ws, "Input.dispatchMouseEvent", {
+                    "type": "mousePressed",
+                    "x": int(post_btn_pos['x']),
+                    "y": int(post_btn_pos['y']),
+                    "button": "left",
+                    "clickCount": 1
+                })
+                time.sleep(random.uniform(0.05, 0.12))
+                self._cdp_send(ws, "Input.dispatchMouseEvent", {
+                    "type": "mouseReleased",
+                    "x": int(post_btn_pos['x']),
+                    "y": int(post_btn_pos['y']),
+                    "button": "left",
+                    "clickCount": 1
+                })
+
+                time.sleep(random.uniform(5, 8))  # Đợi đăng xong
+
+                # ===== BƯỚC 7: Lấy URL bài đăng =====
+                # Tìm POST ID MỚI (không có trong danh sách cũ)
+                debug_count = self._cdp_evaluate(ws, "document.querySelectorAll('a[href*=\"/posts/\"]').length")
+                print(f"[Groups] DEBUG: Số links /posts/ SAU khi đăng = {debug_count}")
+                
+                post_url = self._get_new_post_url(ws, group_id, existing_ids, msg_id)
+                print(f"[Groups] Kết quả URL: '{post_url}'")
+                
+                if post_url and 'facebook.com' in post_url:
+                    self.signal.log_message.emit(f"✓ Đã đăng vào {group_name[:25]} - URL: {post_url[:50]}...", "success")
+                    self.signal.posted_log.emit(f"✅ {group_name} | {post_url}")
+                else:
+                    self.signal.log_message.emit(f"✓ Đã đăng vào {group_name[:25]} (không lấy được URL)", "success")
+                    self.signal.posted_log.emit(f"✅ {group_name} | (không lấy được URL)")
 
                 # Lưu lịch sử
                 save_post_history({
@@ -1813,6 +2551,7 @@ class GroupsPage(QWidget):
                     'group_id': group_id,
                     'group_name': group_name,
                     'content': post_text[:200],
+                    'post_url': post_url,
                     'status': 'success',
                     'posted_at': time.strftime('%Y-%m-%d %H:%M:%S')
                 })
@@ -1856,6 +2595,11 @@ class GroupsPage(QWidget):
         self.post_progress.setValue(int(current / total * 100))
         self.post_status.setText(f"Tiến trình: {current} / {total}")
 
+    def _on_posted_log(self, entry: str):
+        """Ghi vào nhật ký đăng tường"""
+        timestamp = time.strftime("%H:%M:%S")
+        self.posted_log.append(f"[{timestamp}] {entry}")
+
     def _on_post_complete(self):
         self._is_posting = False
         self.btn_post.setEnabled(True)
@@ -1866,7 +2610,7 @@ class GroupsPage(QWidget):
     # ============ BOOST TAB ============
 
     def _load_boost_posts(self):
-        """Load posted history for boost"""
+        """Load posted history for boost with pagination"""
         filter_idx = self.date_filter.currentIndex()
 
         if filter_idx == 0:  # Today
@@ -1878,10 +2622,21 @@ class GroupsPage(QWidget):
         else:  # All
             days = 9999
 
-        self.boost_posts = get_post_history_filtered(days_back=days)
+        # Get total count
+        self._boost_total_count = get_post_history_count(days_back=days)
+
+        # Get current page data
+        offset = self._boost_page * self._boost_page_size
+        self.boost_posts = get_post_history_filtered(
+            days_back=days,
+            limit=self._boost_page_size,
+            offset=offset
+        )
         self._render_boost_posts()
+        self._update_pagination_ui()
 
     def _on_date_filter_change(self, idx):
+        self._boost_page = 0  # Reset to first page
         self._load_boost_posts()
 
     def _render_boost_posts(self):
@@ -1949,7 +2704,7 @@ class GroupsPage(QWidget):
         self.boost_count.setText(f"{len(self.boost_posts)} bài")
 
     def _toggle_select_all_boost(self, state):
-        checked = state == Qt.Checked
+        checked = state == Qt.CheckState.Checked or state == 2
         for cb in self.boost_checkboxes.values():
             cb.setChecked(checked)
 
@@ -2107,12 +2862,17 @@ class GroupsPage(QWidget):
                                 new_msg_id[0] += 1
                                 msg = {"id": new_msg_id[0], "method": method, "params": params or {}}
                                 new_ws.send(json_module.dumps(msg))
-                                try:
-                                    new_ws.settimeout(30)
-                                    resp = new_ws.recv()
-                                    return json_module.loads(resp)
-                                except:
-                                    return {}
+                                # Đọc cho đến khi nhận đúng response
+                                for _ in range(50):
+                                    try:
+                                        new_ws.settimeout(30)
+                                        resp = new_ws.recv()
+                                        data = json_module.loads(resp)
+                                        if data.get('id') == new_msg_id[0]:
+                                            return data
+                                    except:
+                                        return {}
+                                return {}
 
                             def eval_new(expr):
                                 result = send_new("Runtime.evaluate", {
@@ -2270,3 +3030,1203 @@ class GroupsPage(QWidget):
         self.btn_stop_comment.setEnabled(False)
         self.comment_progress.setValue(100)
         self.log("Bình luận hoàn tất!", "success")
+
+    # ==================== PAGINATION METHODS ====================
+    
+    def _prev_boost_page(self):
+        """Go to previous page"""
+        if self._boost_page > 0:
+            self._boost_page -= 1
+            self._load_boost_posts()
+
+    def _next_boost_page(self):
+        """Go to next page"""
+        total_pages = max(1, (self._boost_total_count + self._boost_page_size - 1) // self._boost_page_size)
+        if self._boost_page + 1 < total_pages:
+            self._boost_page += 1
+            self._load_boost_posts()
+
+    def _update_pagination_ui(self):
+        """Update pagination buttons and label"""
+        total_pages = max(1, (self._boost_total_count + self._boost_page_size - 1) // self._boost_page_size)
+        current_page = self._boost_page + 1
+
+        self.page_label.setText(f"Trang {current_page}/{total_pages}")
+
+        # Enable/disable buttons
+        self.btn_prev_page.setEnabled(self._boost_page > 0)
+        self.btn_next_page.setEnabled(current_page < total_pages)
+
+    # ==================== HELPER METHODS ====================
+
+    def _normalize_vietnamese(self, text: str) -> str:
+        """Chuẩn hóa text tiếng Việt để tìm kiếm - bỏ dấu, lowercase"""
+        if not text:
+            return ""
+        import unicodedata
+        text = text.lower()
+        text = unicodedata.normalize('NFD', text)
+        text = ''.join(c for c in text if unicodedata.category(c) != 'Mn')
+        text = unicodedata.normalize('NFC', text)
+        text = text.replace('đ', 'd').replace('Đ', 'd')
+        return text
+
+    def _get_random_images(self, folder_path: str, count: int) -> List[str]:
+        """Lấy random ảnh từ thư mục"""
+        if not os.path.isdir(folder_path):
+            return []
+        img_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
+        images = []
+        for f in os.listdir(folder_path):
+            if os.path.splitext(f)[1].lower() in img_extensions:
+                images.append(os.path.join(folder_path, f))
+        if len(images) <= count:
+            return images
+        return random.sample(images, count)
+
+    def _cdp_send(self, ws, method: str, params: Dict = None) -> Dict:
+        """Gửi CDP command và nhận response"""
+        if not ws:
+            return {"error": "No WebSocket connection"}
+
+        self._cdp_id += 1
+        msg = {"id": self._cdp_id, "method": method, "params": params or {}}
+
+        try:
+            ws.send(json_module.dumps(msg))
+        except Exception as e:
+            return {"error": f"WebSocket send failed: {str(e)}", "ws_closed": True}
+
+        while True:
+            try:
+                ws.settimeout(30)
+                resp = ws.recv()
+                data = json_module.loads(resp)
+                if data.get('id') == self._cdp_id:
+                    return data
+            except Exception as e:
+                return {"error": f"WebSocket recv failed: {str(e)}", "ws_closed": True}
+
+    def _cdp_evaluate(self, ws, expression: str):
+        """Evaluate JavaScript trong browser"""
+        result = self._cdp_send(ws, "Runtime.evaluate", {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": True
+        })
+        return result.get('result', {}).get('result', {}).get('value')
+
+    def _is_ws_connected(self, ws) -> bool:
+        """Kiểm tra WebSocket còn kết nối không"""
+        if not ws:
+            return False
+        try:
+            result = self._cdp_send(ws, "Runtime.evaluate", {
+                "expression": "1+1",
+                "returnByValue": True
+            })
+            if result.get('ws_closed'):
+                return False
+            return result.get('result', {}).get('result', {}).get('value') == 2
+        except:
+            return False
+
+    def _is_browser_alive(self, cdp_base: str) -> bool:
+        """Kiểm tra browser còn chạy không"""
+        try:
+            resp = requests.get(f"{cdp_base}/json/version", timeout=3)
+            return resp.status_code == 200
+        except:
+            return False
+
+    def _get_or_create_ws(self, ws, cdp_base: str, target_url: str = None):
+        """
+        Kiểm tra WS hiện tại, nếu không ok thì tạo tab mới.
+        Returns: (ws, success)
+        """
+        # Check WS hiện tại
+        if self._is_ws_connected(ws):
+            return (ws, True)
+
+        print(f"[WARN] WebSocket mất kết nối, đang reconnect...")
+
+        # Kiểm tra browser còn sống không
+        if not self._is_browser_alive(cdp_base):
+            print(f"[ERROR] Browser đã đóng hoàn toàn, không thể reconnect")
+            return (None, False)
+
+        # Thử lấy WS từ tab hiện có
+        try:
+            resp = requests.get(f"{cdp_base}/json", timeout=10)
+            pages = resp.json()
+            for p in pages:
+                if p.get('type') == 'page':
+                    ws_url = p.get('webSocketDebuggerUrl')
+                    if ws_url:
+                        try:
+                            new_ws = websocket.create_connection(ws_url, timeout=30, suppress_origin=True)
+                            print(f"[INFO] Đã reconnect WS từ tab có sẵn")
+                            return (new_ws, True)
+                        except:
+                            pass
+        except:
+            pass
+
+        # Không có tab nào, tạo tab mới
+        if target_url:
+            try:
+                resp = requests.get(f"{cdp_base}/json/new?{target_url}", timeout=10)
+                new_page = resp.json()
+                ws_url = new_page.get('webSocketDebuggerUrl')
+                if ws_url:
+                    new_ws = websocket.create_connection(ws_url, timeout=30, suppress_origin=True)
+                    print(f"[INFO] Đã tạo tab mới và kết nối WS")
+                    return (new_ws, True)
+            except Exception as e:
+                print(f"[ERROR] Không tạo được tab mới: {e}")
+
+        return (ws, False)
+
+    def _close_old_tabs_and_prepare(self, cdp_base: str, profile_uuid: str):
+        """Đóng hết tab cũ, giữ lại 1 tab và navigate về about:blank"""
+        try:
+            resp = requests.get(f"{cdp_base}/json", timeout=10)
+            all_pages = resp.json()
+            page_targets = [p for p in all_pages if p.get('type') == 'page']
+
+            if len(page_targets) > 0:
+                # Navigate tab đầu tiên về about:blank TRƯỚC (giữ browser mở)
+                first_tab_ws = page_targets[0].get('webSocketDebuggerUrl')
+                if first_tab_ws:
+                    try:
+                        temp_ws = websocket.create_connection(first_tab_ws, timeout=10, suppress_origin=True)
+                        temp_ws.send(json_module.dumps({
+                            "id": 1,
+                            "method": "Page.navigate",
+                            "params": {"url": "about:blank"}
+                        }))
+                        temp_ws.recv()
+                        temp_ws.close()
+                        print(f"[INFO] Đã navigate tab chính về about:blank")
+                    except Exception as e:
+                        print(f"[WARN] Không navigate được tab chính: {e}")
+
+                # SAU ĐÓ mới đóng các tab còn lại
+                if len(page_targets) > 1:
+                    for p in page_targets[1:]:
+                        target_id = p.get('id')
+                        if target_id:
+                            requests.get(f"{cdp_base}/json/close/{target_id}", timeout=5)
+                    time.sleep(1)
+                    print(f"[INFO] Đã đóng {len(page_targets) - 1} tab cũ")
+            else:
+                # Không có tab nào, tạo tab mới
+                print(f"[WARN] Không có tab nào, tạo tab mới...")
+                requests.get(f"{cdp_base}/json/new?about:blank", timeout=10)
+                time.sleep(1)
+        except Exception as e:
+            print(f"[WARN] Không đóng được tab cũ: {e}")
+
+    def _move_mouse_human(self, ws, target_x: int, target_y: int, steps: int = 20):
+        """Di chuyển chuột theo đường cong như người thật"""
+        import math
+
+        current_x = random.randint(100, 300)
+        current_y = random.randint(100, 200)
+
+        # Quadratic Bezier curve control point
+        ctrl_x = (current_x + target_x) / 2 + random.randint(-100, 100)
+        ctrl_y = (current_y + target_y) / 2 + random.randint(-50, 50)
+
+        for i in range(steps + 1):
+            t = i / steps
+            x = int((1-t)**2 * current_x + 2*(1-t)*t * ctrl_x + t**2 * target_x)
+            y = int((1-t)**2 * current_y + 2*(1-t)*t * ctrl_y + t**2 * target_y)
+
+            self._cdp_send(ws, "Input.dispatchMouseEvent", {
+                "type": "mouseMoved",
+                "x": x,
+                "y": y
+            })
+            time.sleep(random.uniform(0.005, 0.02))
+
+    def _auto_react_post(self, ws, react_type: str = "👍 Like"):
+        """Tự động react bài viết sau khi đăng"""
+        try:
+            # Mapping react type
+            react_map = {
+                "👍 Like": "Like",
+                "❤️ Yêu thích": "Love",
+                "😆 Haha": "Haha",
+                "😮 Wow": "Wow",
+                "😢 Buồn": "Sad",
+                "😡 Phẫn nộ": "Angry"
+            }
+            react_name = react_map.get(react_type, "Like")
+
+            # Tìm nút like
+            js_find_like = '''
+            (function() {
+                var likeBtn = document.querySelector('[aria-label="Thích"]') || 
+                             document.querySelector('[aria-label="Like"]') ||
+                             document.querySelector('[data-testid="like_button"]');
+                if (likeBtn) {
+                    var rect = likeBtn.getBoundingClientRect();
+                    return {x: rect.x + rect.width/2, y: rect.y + rect.height/2};
+                }
+                return null;
+            })();
+            '''
+            result = self._cdp_evaluate(ws, js_find_like)
+
+            if result and 'x' in result:
+                # Di chuyển chuột human-like
+                self._move_mouse_human(ws, int(result['x']), int(result['y']))
+                time.sleep(0.3)
+
+                # Hover để hiện menu react
+                self._cdp_send(ws, "Input.dispatchMouseEvent", {
+                    "type": "mousePressed",
+                    "x": int(result['x']),
+                    "y": int(result['y']),
+                    "button": "left",
+                    "clickCount": 1
+                })
+                self._cdp_send(ws, "Input.dispatchMouseEvent", {
+                    "type": "mouseReleased",
+                    "x": int(result['x']),
+                    "y": int(result['y']),
+                    "button": "left"
+                })
+
+                self.signal.log_message.emit(f"✓ Đã {react_type} bài viết", "success")
+                return True
+
+        except Exception as e:
+            self.signal.log_message.emit(f"Lỗi auto react: {str(e)[:30]}", "warning")
+
+        return False
+
+    def _get_new_post_url(self, ws, group_id: str, existing_ids: list, msg_id: list) -> str:
+        """Tìm URL bài viết MỚI (không có trong danh sách existing_ids)"""
+        try:
+            # Helper function để evaluate JS
+            def cdp_eval(expr):
+                msg_id[0] += 1
+                ws.send(json_module.dumps({
+                    "id": msg_id[0],
+                    "method": "Runtime.evaluate",
+                    "params": {
+                        "expression": expr,
+                        "returnByValue": True,
+                        "awaitPromise": True
+                    }
+                }))
+                for _ in range(50):
+                    try:
+                        ws.settimeout(30)
+                        resp = ws.recv()
+                        data = json_module.loads(resp)
+                        if data.get('id') == msg_id[0]:
+                            return data.get('result', {}).get('result', {}).get('value')
+                    except:
+                        break
+                return None
+
+            # Chuyển existing_ids thành JSON string để truyền vào JS
+            existing_ids_json = json_module.dumps(existing_ids)
+
+            # JavaScript để tìm POST ID MỚI - CHỈ từ group hiện tại
+            get_new_url_js = f'''
+            (function() {{
+                let groupId = "{group_id}";
+                let existingIds = {existing_ids_json};
+                let existingSet = new Set(existingIds);
+                console.log('[GetURL] Group ID:', groupId);
+                console.log('[GetURL] Existing IDs:', existingIds.length);
+
+                // Tìm tất cả post IDs hiện tại - CHỈ của group này
+                let currentIds = [];
+                
+                // Từ /posts/ links - CHỈ lấy của group này
+                let postLinks = document.querySelectorAll('a[href*="/groups/"][href*="/posts/"]');
+                for (let link of postLinks) {{
+                    // Kiểm tra link thuộc về group này
+                    if (link.href.includes('/groups/' + groupId + '/') || link.href.includes('/groups/' + groupId + '?')) {{
+                        let match = link.href.match(/\\/posts\\/(\\d+)/);
+                        if (match && match[1]) {{
+                            currentIds.push({{id: match[1], url: link.href}});
+                        }}
+                    }}
+                }}
+
+                // Từ set=pcb. links - cũng filter theo group
+                let pcbLinks = document.querySelectorAll('a[href*="set=pcb."]');
+                for (let link of pcbLinks) {{
+                    // Kiểm tra nếu link nằm trong context của group này
+                    let parentGroup = link.closest('[data-pagelet*="Group"]') || link.closest('[role="article"]');
+                    let match = link.href.match(/set=pcb\\.(\\d+)/);
+                    if (match && match[1]) {{
+                        let url = 'https://www.facebook.com/groups/{group_id}/posts/' + match[1] + '/';
+                        currentIds.push({{id: match[1], url: url}});
+                    }}
+                }}
+
+                console.log('[GetURL] Current IDs from this group:', currentIds.length);
+
+                // Tìm ID MỚI (không có trong existingSet)
+                let newIds = currentIds.filter(item => !existingSet.has(item.id));
+                console.log('[GetURL] NEW IDs:', newIds.length);
+
+                if (newIds.length > 0) {{
+                    // Trả về ID mới đầu tiên (hoặc có thể sort theo ID lớn nhất nếu có nhiều)
+                    console.log('[GetURL] ✓ NEW POST:', newIds[0].url);
+                    return newIds[0].url;
+                }}
+
+                console.log('[GetURL] ✗ Không tìm thấy ID mới');
+                return null;
+            }})()
+            '''
+
+            post_url = cdp_eval(get_new_url_js)
+            print(f"[Groups] URL bài MỚI: {post_url}")
+
+            if post_url:
+                # Clean URL
+                if '?' in post_url:
+                    post_url = post_url.split('?')[0]
+                return post_url
+
+            return ""
+
+        except Exception as e:
+            print(f"[Groups] Lỗi lấy URL mới: {e}")
+            import traceback
+            traceback.print_exc()
+            return ""
+
+    def _get_post_url_from_dom(self, ws, group_id: str, msg_id: list) -> str:
+        """Lấy URL bài viết vừa đăng từ DOM"""
+        try:
+            # Helper function để evaluate JS
+            def cdp_eval(expr):
+                msg_id[0] += 1
+                ws.send(json_module.dumps({
+                    "id": msg_id[0],
+                    "method": "Runtime.evaluate",
+                    "params": {
+                        "expression": expr,
+                        "returnByValue": True,
+                        "awaitPromise": True
+                    }
+                }))
+                for _ in range(50):
+                    try:
+                        ws.settimeout(30)
+                        resp = ws.recv()
+                        data = json_module.loads(resp)
+                        if data.get('id') == msg_id[0]:
+                            return data.get('result', {}).get('result', {}).get('value')
+                    except:
+                        break
+                return None
+
+            # Đơn giản: Tìm TẤT CẢ links có /posts/ và lấy ID lớn nhất
+            get_url_js = '''
+            (function() {
+                console.log('[GetURL] Bắt đầu tìm URL...');
+                
+                // Lấy tất cả links có /posts/
+                let allLinks = document.querySelectorAll('a[href*="/posts/"]');
+                console.log('[GetURL] Tìm thấy', allLinks.length, 'links có /posts/');
+                
+                let postIds = [];
+                for (let link of allLinks) {
+                    let href = link.href;
+                    // Match /posts/POST_ID
+                    let match = href.match(/\\/posts\\/(\\d+)/);
+                    if (match && match[1]) {
+                        postIds.push({id: match[1], url: href});
+                    }
+                }
+
+                console.log('[GetURL] Post IDs:', postIds.length);
+                
+                if (postIds.length > 0) {
+                    // Sắp xếp theo ID giảm dần (số lớn = mới nhất)
+                    postIds.sort((a, b) => {
+                        if (a.id.length !== b.id.length) {
+                            return b.id.length - a.id.length; // Số dài hơn = lớn hơn
+                        }
+                        return b.id.localeCompare(a.id); // So sánh string cho số lớn
+                    });
+                    
+                    console.log('[GetURL] ✓ Post ID lớn nhất:', postIds[0].id);
+                    console.log('[GetURL] ✓ URL:', postIds[0].url);
+                    return postIds[0].url;
+                }
+
+                // Fallback: Tìm set=pcb.POST_ID
+                let pcbLinks = document.querySelectorAll('a[href*="set=pcb."]');
+                console.log('[GetURL] pcb links:', pcbLinks.length);
+                
+                let pcbIds = [];
+                for (let link of pcbLinks) {
+                    let match = link.href.match(/set=pcb\\.(\\d+)/);
+                    if (match && match[1]) {
+                        pcbIds.push(match[1]);
+                    }
+                }
+                
+                if (pcbIds.length > 0) {
+                    pcbIds.sort((a, b) => {
+                        if (a.length !== b.length) return b.length - a.length;
+                        return b.localeCompare(a);
+                    });
+                    let url = 'https://www.facebook.com/groups/GROUP_ID/posts/' + pcbIds[0] + '/';
+                    console.log('[GetURL] ✓ Từ pcb:', url);
+                    return url;
+                }
+
+                // Fallback: Tìm pfbid
+                let pfbLinks = document.querySelectorAll('a[href*="pfbid"]');
+                console.log('[GetURL] pfbid links:', pfbLinks.length);
+                if (pfbLinks.length > 0) {
+                    console.log('[GetURL] ✓ pfbid:', pfbLinks[pfbLinks.length - 1].href);
+                    return pfbLinks[pfbLinks.length - 1].href;
+                }
+
+                console.log('[GetURL] ✗ Không tìm thấy');
+                return null;
+            })()
+            '''
+
+            # Thử lấy URL
+            post_url = cdp_eval(get_url_js)
+            print(f"[Groups] URL từ DOM: {post_url}")
+
+            if post_url:
+                # Fix URL nếu cần (thay GROUP_ID bằng group_id thật)
+                if 'GROUP_ID' in post_url:
+                    post_url = post_url.replace('GROUP_ID', group_id)
+                return post_url
+
+            return ""
+
+        except Exception as e:
+            print(f"[Groups] Lỗi lấy URL từ DOM: {e}")
+            import traceback
+            traceback.print_exc()
+            return ""
+
+    def _get_post_url_after_reload(self, ws, group_id: str, msg_id: list) -> str:
+        """Lấy URL bài viết vừa đăng sau khi reload page"""
+        try:
+            # Helper function để evaluate JS
+            def cdp_eval(expr):
+                msg_id[0] += 1
+                ws.send(json_module.dumps({
+                    "id": msg_id[0],
+                    "method": "Runtime.evaluate",
+                    "params": {
+                        "expression": expr,
+                        "returnByValue": True,
+                        "awaitPromise": True
+                    }
+                }))
+                for _ in range(50):
+                    try:
+                        ws.settimeout(30)
+                        resp = ws.recv()
+                        data = json_module.loads(resp)
+                        if data.get('id') == msg_id[0]:
+                            return data.get('result', {}).get('result', {}).get('value')
+                    except:
+                        break
+                return None
+
+            # JavaScript để tìm URL bài vừa đăng
+            # Sau khi reload, bài vừa đăng thường là bài ĐẦU TIÊN trong feed
+            # (nếu không cần duyệt) hoặc có trạng thái "Đang chờ duyệt"
+            
+            get_url_js = f'''
+            (function() {{
+                let groupId = '{group_id}';
+                console.log('[GetURL] Tìm bài vừa đăng sau reload, groupId:', groupId);
+
+                // Các từ khóa thời gian mới đăng
+                const recentKeywords = [
+                    'vừa xong', 'just now', 'now',
+                    '1 phút', '2 phút', '3 phút', '4 phút', '5 phút',
+                    '1m', '2m', '3m', '4m', '5m', 
+                    '1 min', '2 min', '3 min',
+                    'một phút', 'vài giây', 'giây trước',
+                    'seconds ago', 'minute ago', 'minutes ago'
+                ];
+
+                // Các từ khóa pending
+                const pendingKeywords = [
+                    'đang chờ', 'chờ duyệt', 'pending', 'awaiting', 
+                    'submitted', 'đợi phê duyệt', 'review'
+                ];
+
+                function matchesKeywords(text, keywords) {{
+                    if (!text) return false;
+                    let lower = text.toLowerCase();
+                    for (let kw of keywords) {{
+                        if (lower.includes(kw.toLowerCase())) return true;
+                    }}
+                    return false;
+                }}
+
+                function getUrlFromArticle(article) {{
+                    // 1. Tìm set=pcb.POST_ID (link ảnh)
+                    let pcbLinks = article.querySelectorAll('a[href*="set=pcb."]');
+                    for (let link of pcbLinks) {{
+                        let match = link.href.match(/set=pcb\\.(\\d+)/);
+                        if (match && match[1]) {{
+                            return 'https://www.facebook.com/groups/' + groupId + '/posts/' + match[1] + '/';
+                        }}
+                    }}
+
+                    // 2. Tìm /groups/.../posts/
+                    let postLinks = article.querySelectorAll('a[href*="/groups/"][href*="/posts/"]');
+                    for (let link of postLinks) {{
+                        if (link.href.includes(groupId) && !link.href.includes('notif')) {{
+                            return link.href;
+                        }}
+                    }}
+
+                    // 3. Tìm pfbid
+                    let pfbLinks = article.querySelectorAll('a[href*="pfbid"]');
+                    for (let link of pfbLinks) {{
+                        if (link.href.includes('/groups/')) return link.href;
+                    }}
+
+                    // 4. Tìm permalink
+                    let permaLinks = article.querySelectorAll('a[href*="permalink"]');
+                    for (let link of permaLinks) {{
+                        if (link.href.includes('/groups/')) return link.href;
+                    }}
+
+                    return null;
+                }}
+
+                // Lấy tất cả articles
+                let articles = document.querySelectorAll('[role="article"]');
+                console.log('[GetURL] Tìm thấy', articles.length, 'bài viết');
+
+                // Ưu tiên 1: Tìm bài có thời gian "vừa xong" hoặc pending
+                for (let i = 0; i < articles.length; i++) {{
+                    let article = articles[i];
+                    let text = article.innerText || '';
+                    let first500 = text.substring(0, 500);
+
+                    let isRecent = matchesKeywords(first500, recentKeywords);
+                    let isPending = matchesKeywords(first500, pendingKeywords);
+
+                    if (isRecent || isPending) {{
+                        let url = getUrlFromArticle(article);
+                        if (url) {{
+                            console.log('[GetURL] ✓ Tìm thấy bài', isRecent ? 'MỚI' : 'PENDING', 'tại index', i, ':', url);
+                            return url;
+                        }}
+                    }}
+                }}
+
+                // Ưu tiên 2: Lấy bài ĐẦU TIÊN (sau reload thường là bài mới nhất)
+                if (articles.length > 0) {{
+                    let firstArticle = articles[0];
+                    let url = getUrlFromArticle(firstArticle);
+                    if (url) {{
+                        console.log('[GetURL] ✓ Lấy bài ĐẦU TIÊN:', url);
+                        return url;
+                    }}
+                }}
+
+                // Ưu tiên 3: Tìm bất kỳ link posts nào
+                let allPostLinks = document.querySelectorAll('a[href*="/groups/' + groupId + '/posts/"]');
+                if (allPostLinks.length > 0) {{
+                    // Lấy link đầu tiên
+                    console.log('[GetURL] ✓ Lấy link đầu tiên trong page:', allPostLinks[0].href);
+                    return allPostLinks[0].href;
+                }}
+
+                console.log('[GetURL] ✗ Không tìm thấy URL nào');
+                return null;
+            }})()
+            '''
+
+            # Thử lấy URL
+            post_url = cdp_eval(get_url_js)
+            print(f"[Groups] URL sau reload: {post_url}")
+
+            if post_url and '/groups/' in post_url and ('/posts/' in post_url or 'pfbid' in post_url):
+                return post_url
+
+            return post_url or ""
+
+        except Exception as e:
+            print(f"[Groups] Lỗi lấy URL sau reload: {e}")
+            import traceback
+            traceback.print_exc()
+            return ""
+
+    def _get_post_url_current_tab(self, ws, group_id: str, msg_id: list) -> str:
+        """Lấy URL bài viết vừa đăng trực tiếp trên tab hiện tại"""
+        try:
+            # Helper function để evaluate JS
+            def cdp_eval(expr):
+                msg_id[0] += 1
+                ws.send(json_module.dumps({
+                    "id": msg_id[0],
+                    "method": "Runtime.evaluate",
+                    "params": {
+                        "expression": expr,
+                        "returnByValue": True,
+                        "awaitPromise": True
+                    }
+                }))
+                # Đọc cho đến khi nhận đúng response
+                for _ in range(50):
+                    try:
+                        ws.settimeout(30)
+                        resp = ws.recv()
+                        data = json_module.loads(resp)
+                        if data.get('id') == msg_id[0]:
+                            return data.get('result', {}).get('result', {}).get('value')
+                    except:
+                        break
+                return None
+
+            # JavaScript để tìm URL bài vừa đăng
+            # Sau khi đăng, Facebook thường hiển thị:
+            # 1. URL trong thanh địa chỉ thay đổi (nếu không duyệt)
+            # 2. Có notification/toast hiển thị "Đã đăng" với link
+            # 3. Bài viết mới xuất hiện trong feed (có thể ở dưới hoặc pending)
+            
+            get_url_js = f'''
+            (function() {{
+                let groupId = '{group_id}';
+                console.log('[GetURL] Tìm URL bài đăng, groupId:', groupId);
+
+                // 1. Kiểm tra URL hiện tại - FB có thể đã redirect đến bài viết
+                let currentUrl = window.location.href;
+                console.log('[GetURL] Current URL:', currentUrl);
+                if (currentUrl.includes('/posts/') || currentUrl.includes('pfbid')) {{
+                    console.log('[GetURL] ✓ URL đã là bài viết!');
+                    return currentUrl;
+                }}
+
+                // 2. Tìm toast/notification "Đã đăng bài" có chứa link
+                let toasts = document.querySelectorAll('[role="alert"], [role="status"], [data-testid*="toast"]');
+                for (let toast of toasts) {{
+                    let links = toast.querySelectorAll('a[href*="/posts/"], a[href*="pfbid"]');
+                    if (links.length > 0) {{
+                        console.log('[GetURL] ✓ Tìm thấy link trong toast:', links[0].href);
+                        return links[0].href;
+                    }}
+                }}
+
+                // 3. Tìm bài có trạng thái "Đang chờ duyệt" / "Pending" / "Submitted"
+                let articles = document.querySelectorAll('[role="article"]');
+                console.log('[GetURL] Found', articles.length, 'articles');
+                
+                for (let article of articles) {{
+                    let text = article.innerText || '';
+                    // Kiểm tra có phải bài pending không
+                    let isPending = text.includes('Đang chờ') || text.includes('Pending') || 
+                                    text.includes('đợi duyệt') || text.includes('Submitted') ||
+                                    text.includes('chờ phê duyệt') || text.includes('awaiting');
+                    
+                    // Kiểm tra bài vừa đăng (thời gian gần)
+                    let isRecent = text.includes('vừa xong') || text.includes('just now') ||
+                                   text.includes('1 phút') || text.includes('1m') ||
+                                   text.includes('1 min') || text.includes('vài giây');
+
+                    if (isPending || isRecent) {{
+                        // Tìm URL trong article này
+                        // Cách 1: set=pcb.POST_ID (link ảnh)
+                        let pcbLinks = article.querySelectorAll('a[href*="set=pcb."]');
+                        for (let link of pcbLinks) {{
+                            let match = link.href.match(/set=pcb\\.(\\d+)/);
+                            if (match && match[1]) {{
+                                let postUrl = 'https://www.facebook.com/groups/' + groupId + '/posts/' + match[1] + '/';
+                                console.log('[GetURL] ✓ Got from pcb (pending/recent):', postUrl);
+                                return postUrl;
+                            }}
+                        }}
+                        
+                        // Cách 2: /groups/.../posts/
+                        let postLinks = article.querySelectorAll('a[href*="/groups/"][href*="/posts/"]');
+                        for (let link of postLinks) {{
+                            if (link.href.includes(groupId)) {{
+                                console.log('[GetURL] ✓ Got direct (pending/recent):', link.href);
+                                return link.href;
+                            }}
+                        }}
+
+                        // Cách 3: pfbid
+                        let pfbLinks = article.querySelectorAll('a[href*="pfbid"]');
+                        for (let link of pfbLinks) {{
+                            if (link.href.includes('/groups/')) {{
+                                console.log('[GetURL] ✓ Got pfbid (pending/recent):', link.href);
+                                return link.href;
+                            }}
+                        }}
+                    }}
+                }}
+
+                // 4. Fallback: Scroll xuống và tìm bài cuối cùng (bài mới thường ở dưới)
+                window.scrollTo(0, document.body.scrollHeight);
+                
+                // Tìm bài cuối cùng trong feed
+                let lastArticle = articles[articles.length - 1];
+                if (lastArticle) {{
+                    let pcbLinks = lastArticle.querySelectorAll('a[href*="set=pcb."]');
+                    for (let link of pcbLinks) {{
+                        let match = link.href.match(/set=pcb\\.(\\d+)/);
+                        if (match && match[1]) {{
+                            let postUrl = 'https://www.facebook.com/groups/' + groupId + '/posts/' + match[1] + '/';
+                            console.log('[GetURL] ✓ Got from LAST article:', postUrl);
+                            return postUrl;
+                        }}
+                    }}
+
+                    let postLinks = lastArticle.querySelectorAll('a[href*="/posts/"]');
+                    if (postLinks.length > 0) {{
+                        console.log('[GetURL] ✓ Got from LAST article link:', postLinks[0].href);
+                        return postLinks[0].href;
+                    }}
+                }}
+
+                // 5. Fallback cuối: Tìm bất kỳ link posts nào trong page
+                let allPostLinks = document.querySelectorAll('a[href*="/groups/' + groupId + '/posts/"]');
+                if (allPostLinks.length > 0) {{
+                    // Lấy link cuối cùng (có thể là bài mới nhất)
+                    let lastLink = allPostLinks[allPostLinks.length - 1];
+                    console.log('[GetURL] ✓ Got last post link:', lastLink.href);
+                    return lastLink.href;
+                }}
+
+                console.log('[GetURL] ✗ Không tìm thấy URL');
+                return null;
+            }})()
+            '''
+
+            # Thử lấy URL với retry
+            post_url = None
+            for attempt in range(3):
+                post_url = cdp_eval(get_url_js)
+                print(f"[Groups] Attempt {attempt + 1}/3 - URL: {post_url}")
+
+                if post_url and '/groups/' in post_url and ('/posts/' in post_url or 'pfbid' in post_url):
+                    print(f"[Groups] ✓ Tìm thấy URL!")
+                    return post_url
+
+                # Scroll và thử lại
+                if attempt < 2:
+                    time.sleep(2)
+                    cdp_eval("window.scrollBy(0, 500);")
+                    time.sleep(1)
+
+            return post_url or ""
+
+        except Exception as e:
+            print(f"[Groups] Lỗi lấy URL: {e}")
+            import traceback
+            traceback.print_exc()
+            return ""
+
+    def _get_post_url_new_tab(self, ws, cdp_base: str, group_url: str, group_id: str, msg_id: list) -> str:
+        """Mở tab mới để lấy URL bài viết vừa đăng"""
+        try:
+            # Đợi FB cập nhật feed
+            time.sleep(random.uniform(3, 5))
+
+            # Tạo tab mới navigate đến group
+            msg_id[0] += 1
+            ws.send(json_module.dumps({
+                "id": msg_id[0],
+                "method": "Target.createTarget",
+                "params": {"url": group_url}
+            }))
+            
+            # Đọc cho đến khi nhận response có id khớp
+            target_id = None
+            for _ in range(50):  # Max 50 messages
+                try:
+                    ws.settimeout(30)
+                    resp = ws.recv()
+                    data = json_module.loads(resp)
+                    if data.get('id') == msg_id[0]:
+                        target_id = data.get('result', {}).get('targetId')
+                        break
+                except:
+                    break
+
+            if not target_id:
+                print(f"[Groups] Không tạo được tab mới")
+                return ""
+
+            print(f"[Groups] Tạo tab mới OK, targetId: {target_id[:20]}...")
+            time.sleep(random.uniform(3, 4))
+
+            # Lấy WebSocket của tab mới
+            new_ws_url = None
+            try:
+                resp = requests.get(f"{cdp_base}/json", timeout=10)
+                pages = resp.json()
+                for p in pages:
+                    if p.get('id') == target_id:
+                        new_ws_url = p.get('webSocketDebuggerUrl')
+                        break
+            except:
+                pass
+
+            if not new_ws_url:
+                print(f"[Groups] Không lấy được WS URL tab mới")
+                return ""
+
+            # Kết nối WebSocket tab mới
+            new_ws = None
+            try:
+                new_ws = websocket.create_connection(new_ws_url, timeout=30, suppress_origin=True)
+            except:
+                try:
+                    new_ws = websocket.create_connection(new_ws_url, timeout=30)
+                except:
+                    print(f"[Groups] Không kết nối được WS tab mới")
+                    return ""
+
+            new_msg_id = [0]
+
+            def send_new(method, params=None):
+                new_msg_id[0] += 1
+                msg = {"id": new_msg_id[0], "method": method, "params": params or {}}
+                new_ws.send(json_module.dumps(msg))
+                # Đọc cho đến khi nhận response có id khớp
+                while True:
+                    try:
+                        new_ws.settimeout(30)
+                        resp = new_ws.recv()
+                        data = json_module.loads(resp)
+                        if data.get('id') == new_msg_id[0]:
+                            return data
+                    except:
+                        return {}
+
+            def eval_new(expr):
+                result = send_new("Runtime.evaluate", {
+                    "expression": expr,
+                    "returnByValue": True,
+                    "awaitPromise": True
+                })
+                return result.get('result', {}).get('result', {}).get('value')
+
+            # Đợi page load
+            time.sleep(random.uniform(2, 3))
+            for _ in range(10):
+                ready = eval_new("document.readyState")
+                if ready == 'complete':
+                    break
+                time.sleep(1)
+
+            time.sleep(random.uniform(2, 3))
+
+            # Tìm bài vừa đăng - logic cải tiến từ code tham khảo
+            get_post_url_js = f'''
+            (function() {{
+                let groupId = '{group_id}';
+                console.log('[GetURL] Group ID:', groupId);
+                console.log('[GetURL] Current URL:', window.location.href);
+
+                // Các từ khóa thời gian "vừa đăng"
+                const recentKeywords = [
+                    'vừa xong', 'vua xong', 'just now',
+                    '1 phút', '2 phút', '3 phút', '4 phút', '5 phút',
+                    '1m', '2m', '3m', '4m', '5m',
+                    '1 min', '2 min', '3 min', '4 min', '5 min',
+                    '1 minute', '2 minutes', '3 minutes', '4 minutes', '5 minutes',
+                    'một phút', 'hai phút', 'vài giây', 'a few seconds',
+                    '1 giây', '2 giây', '5 giây', '10 giây', '30 giây', '45 giây',
+                    '1s', '2s', '5s', '10s', '30s', '45s',
+                    'now', 'mới'
+                ];
+
+                function isRecentTime(text) {{
+                    if (!text) return false;
+                    let normalized = text.toLowerCase().replace(/\\s+/g, '');
+                    for (let kw of recentKeywords) {{
+                        if (normalized.includes(kw.toLowerCase().replace(/\\s+/g, ''))) {{
+                            return true;
+                        }}
+                    }}
+                    return false;
+                }}
+
+                function getPostUrlFromArticle(post) {{
+                    // 1. Tìm pcb link (link ảnh có set=pcb.POST_ID)
+                    let pcbLinks = post.querySelectorAll('a[href*="set=pcb."]');
+                    for (let link of pcbLinks) {{
+                        let match = link.href.match(/set=pcb\\.(\\d+)/);
+                        if (match && match[1]) {{
+                            let postId = match[1];
+                            let postUrl = 'https://www.facebook.com/groups/' + groupId + '/posts/' + postId + '/';
+                            console.log('[GetURL] Got URL from pcb:', postUrl);
+                            return postUrl;
+                        }}
+                    }}
+
+                    // 2. Tìm link /groups/.../posts/ trực tiếp
+                    let postLinks = post.querySelectorAll('a[href*="/groups/"][href*="/posts/"]');
+                    for (let link of postLinks) {{
+                        if (link.href && !link.href.includes('notif_id') && link.href.includes(groupId)) {{
+                            console.log('[GetURL] Got direct post URL:', link.href);
+                            return link.href;
+                        }}
+                    }}
+
+                    // 3. Tìm permalink hoặc pfbid
+                    let permalinks = post.querySelectorAll('a[href*="pfbid"], a[href*="permalink"]');
+                    for (let link of permalinks) {{
+                        if (link.href && link.href.includes('/groups/')) {{
+                            console.log('[GetURL] Got permalink:', link.href);
+                            return link.href;
+                        }}
+                    }}
+
+                    // 4. Tìm bất kỳ link nào có post id pattern
+                    let allLinks = post.querySelectorAll('a[href*="/groups/"]');
+                    for (let link of allLinks) {{
+                        let href = link.href;
+                        // Match patterns like /posts/123 or /permalink/123 or pfbid...
+                        if (href.match(/\\/posts\\/\\d+/) || href.includes('pfbid') || href.includes('permalink')) {{
+                            console.log('[GetURL] Got link pattern:', href);
+                            return href;
+                        }}
+                    }}
+
+                    return null;
+                }}
+
+                // Tìm trong các articles
+                let articles = document.querySelectorAll('[role="article"]');
+                console.log('[GetURL] Found', articles.length, 'articles');
+
+                // *** QUAN TRỌNG: Lấy bài đầu tiên vì nó là bài vừa đăng ***
+                if (articles.length > 0) {{
+                    // Bài đầu tiên thường là bài mới nhất
+                    let firstArticle = articles[0];
+                    let url = getPostUrlFromArticle(firstArticle);
+                    if (url) {{
+                        console.log('[GetURL] ✓ Got URL from FIRST article:', url);
+                        return url;
+                    }}
+                }}
+
+                // Fallback: Tìm bài có thời gian mới
+                for (let article of articles) {{
+                    let hasRecentTime = false;
+
+                    // Tìm trong abbr, time elements
+                    let timeEls = article.querySelectorAll('abbr, time, [data-utime]');
+                    for (let el of timeEls) {{
+                        let text = el.innerText || el.getAttribute('title') || '';
+                        if (isRecentTime(text)) {{
+                            hasRecentTime = true;
+                            break;
+                        }}
+                    }}
+
+                    // Tìm trong aria-label của các link
+                    if (!hasRecentTime) {{
+                        let links = article.querySelectorAll('a[aria-label]');
+                        for (let link of links) {{
+                            let label = link.getAttribute('aria-label') || '';
+                            if (isRecentTime(label)) {{
+                                hasRecentTime = true;
+                                break;
+                            }}
+                        }}
+                    }}
+
+                    // Tìm trong text đầu bài viết
+                    if (!hasRecentTime) {{
+                        let firstText = (article.innerText || '').substring(0, 500);
+                        if (isRecentTime(firstText)) {{
+                            hasRecentTime = true;
+                        }}
+                    }}
+
+                    if (hasRecentTime) {{
+                        let url = getPostUrlFromArticle(article);
+                        if (url) {{
+                            console.log('[GetURL] ✓ FOUND POST URL (recent time):', url);
+                            return url;
+                        }}
+                    }}
+                }}
+
+                // Fallback: Tìm link trực tiếp trong page
+                console.log('[GetURL] No article match, searching page directly...');
+                let allPostLinks = document.querySelectorAll('a[href*="/groups/' + groupId + '/posts/"]');
+                console.log('[GetURL] Found', allPostLinks.length, 'direct post links');
+                if (allPostLinks.length > 0) {{
+                    // Lấy link đầu tiên
+                    let firstLink = allPostLinks[0];
+                    if (firstLink.href && !firstLink.href.includes('notif_id')) {{
+                        console.log('[GetURL] ✓ Direct link:', firstLink.href);
+                        return firstLink.href;
+                    }}
+                }}
+
+                // Fallback: Tìm pcb link trong toàn page
+                let allPcbLinks = document.querySelectorAll('a[href*="set=pcb."]');
+                if (allPcbLinks.length > 0) {{
+                    let match = allPcbLinks[0].href.match(/set=pcb\\.(\\d+)/);
+                    if (match && match[1]) {{
+                        let postId = match[1];
+                        let postUrl = 'https://www.facebook.com/groups/' + groupId + '/posts/' + postId + '/';
+                        console.log('[GetURL] ✓ Built from pcb:', postUrl);
+                        return postUrl;
+                    }}
+                }}
+
+                // Fallback cuối: Tìm bất kỳ link có pfbid
+                let pfbidLinks = document.querySelectorAll('a[href*="pfbid"]');
+                for (let link of pfbidLinks) {{
+                    if (link.href.includes('/groups/')) {{
+                        console.log('[GetURL] ✓ pfbid link:', link.href);
+                        return link.href;
+                    }}
+                }}
+
+                console.log('[GetURL] ✗ No valid URL found');
+                return null;
+            }})()
+            '''
+
+            # Thử lấy URL với retry
+            post_url = None
+            for attempt in range(5):
+                post_url = eval_new(get_post_url_js)
+                print(f"[Groups] Attempt {attempt + 1}/5 - URL: {post_url}")
+
+                # Chỉ chấp nhận URL hợp lệ
+                if post_url and '/groups/' in post_url and ('/posts/' in post_url or 'pfbid' in post_url):
+                    print(f"[Groups] ✓ Tìm thấy URL hợp lệ!")
+                    break
+
+                post_url = None
+                if attempt < 4:
+                    print(f"[Groups] Reload và thử lại...")
+                    time.sleep(random.uniform(2, 3))
+                    send_new("Page.reload", {})
+                    time.sleep(random.uniform(3, 4))
+
+            # Đóng tab mới
+            try:
+                new_ws.close()
+                requests.get(f"{cdp_base}/json/close/{target_id}", timeout=5)
+            except:
+                pass
+
+            if post_url:
+                print(f"[Groups] Tìm thấy post URL: {post_url}")
+                return post_url
+            else:
+                print(f"[Groups] Không tìm thấy URL bài đăng")
+                return ""
+
+        except Exception as e:
+            print(f"[Groups] Lỗi lấy post URL: {e}")
+            import traceback
+            traceback.print_exc()
+            return ""
+
+    # ============ SETTINGS SAVE/LOAD ============
+
+    def _save_settings(self):
+        """Lưu settings vào file để khôi phục khi mở lại app"""
+        try:
+            # Lưu các cài đặt POST tab
+            self._settings.setValue("post/attach_img_checked", self.attach_img_cb.isChecked())
+            self._settings.setValue("post/img_folder", self.img_folder_input.text())
+            self._settings.setValue("post/img_count", self.img_count_spin.value())
+            self._settings.setValue("post/random_content_checked", self.random_content_cb.isChecked())
+            self._settings.setValue("post/delay", self.delay_spin.value())
+            self._settings.setValue("post/random_delay_checked", self.random_delay_cb.isChecked())
+            
+            # Lưu category đã chọn
+            self._settings.setValue("post/category_index", self.cat_combo.currentIndex())
+            
+            # Lưu nội dung đã nhập
+            self._settings.setValue("post/content_text", self.content_input.toPlainText())
+            
+            # Sync settings
+            self._settings.sync()
+            
+        except Exception as e:
+            try:
+                print(f"[Settings] Error saving settings: {e}")
+            except Exception:
+                pass
+
+    def _load_settings(self):
+        """Load settings từ file khi mở app"""
+        try:
+            # Load các cài đặt POST tab
+            if self._settings.contains("post/attach_img_checked"):
+                checked = self._settings.value("post/attach_img_checked", False, type=bool)
+                self.attach_img_cb.setChecked(checked)
+            
+            if self._settings.contains("post/img_folder"):
+                folder = self._settings.value("post/img_folder", "")
+                if folder and os.path.isdir(folder):
+                    self.img_folder_input.setText(folder)
+                    self.img_folder_input.setEnabled(self.attach_img_cb.isChecked())
+                    # Count images
+                    count = sum(1 for f in os.listdir(folder) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')))
+                    self.img_count_label.setText(f"(Tổng: {count} ảnh)")
+            
+            if self._settings.contains("post/img_count"):
+                self.img_count_spin.setValue(self._settings.value("post/img_count", 5, type=int))
+            
+            if self._settings.contains("post/random_content_checked"):
+                self.random_content_cb.setChecked(self._settings.value("post/random_content_checked", False, type=bool))
+            
+            if self._settings.contains("post/delay"):
+                self.delay_spin.setValue(self._settings.value("post/delay", 5, type=int))
+            
+            if self._settings.contains("post/random_delay_checked"):
+                self.random_delay_cb.setChecked(self._settings.value("post/random_delay_checked", True, type=bool))
+            
+            # Load category (sau khi data đã load)
+            QTimer.singleShot(1000, self._load_category_setting)
+            
+            # Load nội dung
+            if self._settings.contains("post/content_text"):
+                content = self._settings.value("post/content_text", "")
+                if content:
+                    self.content_input.setPlainText(content)
+            
+            self.log("✓ Đã khôi phục cài đặt", "success")
+        except Exception as e:
+            print(f"[Settings] Lỗi load settings: {e}")
+
+    def _load_category_setting(self):
+        """Load category setting sau khi categories đã load"""
+        try:
+            if self._settings.contains("post/category_index"):
+                idx = self._settings.value("post/category_index", 0, type=int)
+                if idx < self.cat_combo.count():
+                    self.cat_combo.setCurrentIndex(idx)
+        except:
+            pass
+
+    def closeEvent(self, event):
+        """Lưu settings khi đóng widget"""
+        self._save_settings()
+        super().closeEvent(event)
