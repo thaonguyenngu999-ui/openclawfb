@@ -105,6 +105,7 @@ Available actions:
 34. add_to_folder - Add profiles to folder (needs folder_uuid, profile_uuids)
 35. sync_tags - Set tags for profile (needs uuid, tags[])
 36. delete_die_profiles - Delete all DIE profiles in a folder
+37. delete_die_all - Check ALL folders and delete all DIE profiles (keep LIVE)
 
 Profile naming convention:
 - "S10", "s10", "S 10" → profile = "S10"
@@ -143,6 +144,7 @@ Examples:
 {"action": "change_fingerprint", "params": {"uuid": "xxx"}, "reply": "Đang đổi fingerprint..."}
 {"action": "change_status", "params": {"uuid": "xxx", "status": "live"}, "reply": "Đang đổi status..."}
 {"action": "delete_die_profiles", "params": {"folder_id": "fb1"}, "reply": "Đang xóa die fb1..."}
+{"action": "delete_die_all", "params": {}, "reply": "Đang xóa die toàn bộ thư mục..."}
 {"action": "chat", "params": {}, "reply": "Chào bác!"}
 
 MULTIPLE ACTIONS IN ONE MESSAGE:
@@ -320,12 +322,15 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
         folders = result.get("folders", [])
         if not folders:
             return "📁 Không có thư mục nào."
+        grand_total = 0
         text = f"📁 **Thư mục ({len(folders)})**\n\n"
         for f in folders:
             name = f.get("name", "?")
             fid = f.get("id", "?")
-            count = f.get("browser_count", f.get("total", "?"))
+            count = f.get("total_browser", f.get("browser_count", f.get("total", 0)))
+            grand_total += count if isinstance(count, int) else 0
             text += f"• **{name}** (id={fid}) — {count} profiles\n"
+        text += f"\n📊 Tổng: **{grand_total}** profiles"
         return text
 
     if act == "list_tags":
@@ -732,6 +737,97 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
         return text
 
     # ===== DELETE DIE PROFILES =====
+    if act == "delete_die_all":
+        # Delete die profiles across ALL folders
+        concurrency = params.get("concurrency", 5)
+        # Get all folders
+        folders_result = await call_fb_api("/list_folders", data={})
+        if "error" in folders_result:
+            return f"❌ Lỗi: {folders_result['error']}"
+        folders = folders_result.get("folders", [])
+        if not folders:
+            return "📁 Không có thư mục nào."
+
+        total_text = f"🗑️ **Xóa DIE toàn bộ ({len(folders)} thư mục)**\n\n"
+        grand_live = 0
+        grand_die = 0
+        grand_deleted = 0
+        grand_locked = 0
+
+        for fi, folder in enumerate(folders):
+            fname = folder.get("name", "?")
+            fid = folder.get("id", "")
+            ftotal = folder.get("total_browser", 0)
+            if ftotal == 0:
+                total_text += f"📁 **{fname}**: 0 profiles (bỏ qua)\n"
+                continue
+
+            # Update progress
+            if telegram_chat_id and telegram_message_id:
+                try:
+                    async with aiohttp.ClientSession() as s:
+                        await s.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
+                            json={"chat_id": telegram_chat_id, "message_id": telegram_message_id,
+                                  "text": f"🔍 [{fi+1}/{len(folders)}] Đang check {fname} ({ftotal} profiles)..."}
+                        )
+                except Exception:
+                    pass
+
+            # Get profiles in this folder
+            list_result = await call_fb_api("/list_profiles", data={"folder_id": str(fid), "page_size": 300})
+            profiles_list = list_result.get("data", [])
+            if isinstance(profiles_list, dict):
+                profiles_list = profiles_list.get("content", [])
+            if not profiles_list:
+                total_text += f"📁 **{fname}**: 0 profiles\n"
+                continue
+
+            profile_names = [p.get("name", "") for p in profiles_list if p.get("name")]
+
+            # Check status
+            batch_result = await call_fb_api("/check_fb_batch", data={
+                "profiles": profile_names,
+                "max_workers": concurrency,
+                "close_after": True,
+                "telegram_chat_id": telegram_chat_id,
+                "telegram_message_id": telegram_message_id,
+                "telegram_token": TELEGRAM_BOT_TOKEN
+            })
+
+            results = batch_result.get("results", [])
+            die_uuids = []
+            live = 0
+            locked = 0
+            for r in results:
+                st = r.get("status", "")
+                if st in ("DIE", "NOT_LOGGED_IN"):
+                    die_uuids.append(r.get("profile_uuid", ""))
+                elif st == "LIVE":
+                    live += 1
+                elif st in ("LOCKED", "2FA"):
+                    locked += 1
+
+            # Delete die
+            deleted = 0
+            if die_uuids:
+                del_result = await call_fb_api("/delete_profiles", data={"uuids": die_uuids})
+                deleted = del_result.get("deleted", len(die_uuids))
+
+            grand_live += live
+            grand_die += len(die_uuids)
+            grand_deleted += deleted
+            grand_locked += locked
+            total_text += f"📁 **{fname}**: ✅{live} 🔒{locked} ❌{len(die_uuids)}"
+            if deleted:
+                total_text += f" 🗑️{deleted}"
+            total_text += "\n"
+
+        total_text += f"\n📊 **Tổng kết:**\n"
+        total_text += f"✅ Live: {grand_live} | 🔒 Lock: {grand_locked}\n"
+        total_text += f"❌ Die: {grand_die} | 🗑️ Đã xóa: {grand_deleted}"
+        return total_text
+
     if act == "delete_die_profiles":
         folder_id = params.get("folder_id")
         if not folder_id:
@@ -1337,6 +1433,9 @@ def try_quick_parse(text: str) -> dict | None:
 
     # ===== DELETE DIE PROFILES =====
     if re.search(r'xóa.*die|delete.*die|xóa.*chết|dọn.*die|xoá.*die', text_lower):
+        # Check if user wants ALL folders
+        if re.search(r'toàn bộ|tất cả|all|hết|mọi|every', text_lower):
+            return {"action": "delete_die_all", "params": {}, "reply": "🗑️ Đang check & xóa die TOÀN BỘ thư mục..."}
         target_folder = folder_id
         if not target_folder:
             fm = re.search(r'fb\s*(\d+)', text_lower)
@@ -1344,6 +1443,8 @@ def try_quick_parse(text: str) -> dict | None:
                 target_folder = f"fb{fm.group(1)}"
         if target_folder:
             return {"action": "delete_die_profiles", "params": {"folder_id": target_folder}, "reply": f"🗑️ Đang check & xóa die trong {target_folder}..."}
+        # No specific folder → do all
+        return {"action": "delete_die_all", "params": {}, "reply": "🗑️ Đang check & xóa die TOÀN BỘ thư mục..."}
 
     # ===== LIST FOLDERS =====
     if re.search(r'thư mục|folder|bao nhiêu.*fb|mấy.*fb|các fb|list.*folder|danh sách.*folder', text_lower) and not profile:
