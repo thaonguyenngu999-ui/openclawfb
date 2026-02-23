@@ -651,6 +651,47 @@ async def execute_action(action: dict, telegram_chat_id: str = None, telegram_me
         else:
             text += f"⚠️ {total} bước đã thực hiện\n"
         text += f"\n📊 {success}✅ / {total} steps"
+        if result.get("used_skill"):
+            text += f"\n🧠 Đã dùng skill đã học"
+        if result.get("duration"):
+            text += f" • {result['duration']}s"
+        return text
+
+    # ===== AGENT SKILLS LIST =====
+    if act == "agent_skills":
+        result = await call_fb_api("/agent_skills", data={})
+        skills = result.get("skills", [])
+        if not skills:
+            return "🧠 Agent chưa học được skill nào."
+        text = f"🧠 *Agent Skills ({len(skills)})*\n\n"
+        for s in skills[:15]:
+            name = s.get("name", "?")[:40]
+            sc = s.get("success_count", 0)
+            fc = s.get("fail_count", 0)
+            steps = s.get("total_steps", 0)
+            text += f"#{s.get('id', '?')} *{name}*\n"
+            text += f"  ✅{sc} ❌{fc} • {steps} bước\n"
+        return text
+
+    # ===== AGENT TASK HISTORY =====
+    if act == "agent_task_history":
+        limit = params.get("limit", 10)
+        result = await call_fb_api("/agent_task_history", data={"limit": limit})
+        history = result.get("history", [])
+        if not history:
+            return "📜 Chưa có lịch sử agent."
+        text = f"📜 *Lịch sử Agent ({len(history)})*\n\n"
+        for h in history[:10]:
+            icon = "✅" if h.get("success") else "❌"
+            task = h.get("task_text", "")[:35]
+            steps = h.get("total_steps", 0)
+            dur = h.get("duration_seconds", 0)
+            skill = h.get("skill_name", "")
+            text += f"{icon} {task}\n"
+            text += f"  {steps} bước • {dur:.0f}s"
+            if skill:
+                text += f" • 🧠 {skill[:20]}"
+            text += "\n"
         return text
 
     return reply
@@ -974,6 +1015,14 @@ def try_quick_parse(text: str) -> dict | None:
     # ===== LIST PROFILES =====
     if re.search(r'liệt kê.*profile|list.*profile|profiles|danh sách.*profile', text_lower):
         return {"action": "list_profiles", "params": {"folder_id": folder_id}, "reply": "📱 Đang lấy danh sách profiles..."}
+
+    # ===== AGENT SKILLS =====
+    if re.search(r'skills?|kỹ năng|đã học|agent.*học', text_lower):
+        return {"action": "agent_skills", "params": {}, "reply": "🧠 Đang xem skills agent đã học..."}
+
+    # ===== AGENT HISTORY =====
+    if re.search(r'lịch sử.*agent|agent.*history|task.*log|agent.*log', text_lower):
+        return {"action": "agent_task_history", "params": {"limit": 10}, "reply": "📜 Đang xem lịch sử agent..."}
 
     # ===== AGENT (catch-all: profile + action-like keywords not matched above) =====
     if profile and re.search(

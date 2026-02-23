@@ -94,7 +94,8 @@ class APIHandler(BaseHTTPRequestHandler):
         no_lock_paths = {'/list_profiles', '/wait', '/send_telegram_photo',
                          '/check_fb_batch', '/check_fb_status',
                          '/fb_nurture_batch', '/vision_skills', '/vision_clear_skills',
-                         '/agent_execute'}
+                         '/agent_execute', '/agent_skills', '/agent_task_history',
+                         '/agent_skill_delete'}
 
         try:
             if path in no_lock_paths:
@@ -443,6 +444,25 @@ class APIHandler(BaseHTTPRequestHandler):
                 task=task, profile_uuid=profile_uuid,
                 telegram_chat_id=telegram_chat_id,
                 telegram_message_id=telegram_message_id)
+
+        elif path == '/agent_skills':
+            import db as _db
+            return {"skills": _db.get_agent_skills(limit=50)}
+
+        elif path == '/agent_task_history':
+            import db as _db
+            profile_uuid = params.get('profile_uuid')
+            limit = int(params.get('limit', 20))
+            return {"history": _db.get_agent_task_history(
+                limit=limit, profile_uuid=profile_uuid)}
+
+        elif path == '/agent_skill_delete':
+            import db as _db
+            skill_id = params.get('skill_id')
+            if not skill_id:
+                return {"error": "skill_id required"}
+            ok = _db.delete_agent_skill(int(skill_id))
+            return {"success": ok}
 
         else:
             return {"error": "Unknown endpoint"}

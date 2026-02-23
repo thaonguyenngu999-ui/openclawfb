@@ -296,7 +296,46 @@ def init_database():
             )
         """)
 
+        # ============ AGENT SKILLS TABLE (learned procedures) ============
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_skills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                task_pattern TEXT NOT NULL,
+                keywords TEXT NOT NULL,
+                steps_json TEXT NOT NULL,
+                total_steps INTEGER DEFAULT 0,
+                success_count INTEGER DEFAULT 0,
+                fail_count INTEGER DEFAULT 0,
+                avg_duration REAL DEFAULT 0,
+                last_used_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # ============ AGENT TASK LOG TABLE ============
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_task_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_uuid TEXT,
+                task_text TEXT NOT NULL,
+                matched_skill_id INTEGER,
+                steps_json TEXT,
+                success INTEGER DEFAULT 0,
+                total_steps INTEGER DEFAULT 0,
+                duration_seconds REAL DEFAULT 0,
+                error_message TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (matched_skill_id) REFERENCES agent_skills(id) ON DELETE SET NULL
+            )
+        """)
+
         # Tạo indexes để tăng tốc query
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_skills_keywords ON agent_skills(keywords)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_task_log_task ON agent_task_log(task_text)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_task_log_skill ON agent_task_log(matched_skill_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_task_log_created ON agent_task_log(created_at DESC)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_contents_category ON contents(category_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_profiles_uuid ON profiles(uuid)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_scripts_type ON scripts(type)")
@@ -1646,6 +1685,157 @@ def clear_posted_reels(profile_uuid: str = None) -> int:
         else:
             cursor.execute("DELETE FROM posted_reels")
         return cursor.rowcount
+
+
+# ============ AGENT SKILLS ============
+
+def search_agent_skills(task_text: str, limit: int = 3) -> List[Dict]:
+    """Tìm skill phù hợp nhất với task bằng keyword matching.
+    Trả về skills đã sort theo relevance score giảm dần."""
+    import re as _re
+    words = set(_re.findall(r'[\w]+', task_text.lower()))
+    if not words:
+        return []
+
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM agent_skills
+            WHERE success_count > fail_count
+            ORDER BY success_count DESC, updated_at DESC
+            LIMIT 50
+        """)
+        candidates = rows_to_list(cursor.fetchall())
+
+    scored = []
+    for skill in candidates:
+        kw_set = set(skill.get("keywords", "").lower().split(","))
+        kw_set = {k.strip() for k in kw_set if k.strip()}
+        if not kw_set:
+            continue
+        overlap = words & kw_set
+        if not overlap:
+            continue
+        score = len(overlap) / max(len(kw_set), 1)
+        # Boost score if task_pattern is substring of task
+        pat = skill.get("task_pattern", "").lower()
+        if pat and pat in task_text.lower():
+            score += 1.0
+        # Boost by success rate
+        total = skill.get("success_count", 0) + skill.get("fail_count", 0)
+        if total > 0:
+            score += 0.3 * (skill.get("success_count", 0) / total)
+        scored.append((score, skill))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [s[1] for s in scored[:limit]]
+
+
+def save_agent_skill(name: str, task_pattern: str, keywords: str,
+                     steps_json: str, total_steps: int,
+                     duration: float = 0) -> Dict:
+    """Lưu skill mới hoặc cập nhật nếu task_pattern giống."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        # Check existing by task_pattern
+        cursor.execute(
+            "SELECT * FROM agent_skills WHERE task_pattern = ?", (task_pattern,))
+        existing = cursor.fetchone()
+        if existing:
+            row = row_to_dict(existing)
+            new_success = row.get("success_count", 0) + 1
+            new_avg = ((row.get("avg_duration", 0) * row.get("success_count", 0)
+                        + duration) / new_success) if new_success else duration
+            cursor.execute("""
+                UPDATE agent_skills
+                SET steps_json = ?, total_steps = ?, success_count = ?,
+                    avg_duration = ?, keywords = ?,
+                    last_used_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (steps_json, total_steps, new_success, new_avg,
+                  keywords, row["id"]))
+            return {"id": row["id"], "updated": True}
+        else:
+            cursor.execute("""
+                INSERT INTO agent_skills
+                (name, task_pattern, keywords, steps_json, total_steps,
+                 success_count, avg_duration, last_used_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, CURRENT_TIMESTAMP)
+            """, (name, task_pattern, keywords, steps_json,
+                  total_steps, duration))
+            return {"id": cursor.lastrowid, "updated": False}
+
+
+def increment_skill_fail(skill_id: int):
+    """Tăng fail_count của skill."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE agent_skills SET fail_count = fail_count + 1,
+            updated_at = CURRENT_TIMESTAMP WHERE id = ?
+        """, (skill_id,))
+
+
+def get_agent_skills(limit: int = 50) -> List[Dict]:
+    """Lấy danh sách tất cả skills."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM agent_skills
+            ORDER BY success_count DESC, updated_at DESC
+            LIMIT ?
+        """, (limit,))
+        return rows_to_list(cursor.fetchall())
+
+
+def delete_agent_skill(skill_id: int) -> bool:
+    """Xóa một skill."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM agent_skills WHERE id = ?", (skill_id,))
+        return cursor.rowcount > 0
+
+
+def log_agent_task(profile_uuid: str, task_text: str,
+                   matched_skill_id: int = None,
+                   steps_json: str = "[]", success: bool = False,
+                   total_steps: int = 0, duration: float = 0,
+                   error_message: str = None) -> int:
+    """Log một lần agent execute."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO agent_task_log
+            (profile_uuid, task_text, matched_skill_id, steps_json,
+             success, total_steps, duration_seconds, error_message)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (profile_uuid, task_text, matched_skill_id, steps_json,
+              1 if success else 0, total_steps, duration, error_message))
+        return cursor.lastrowid
+
+
+def get_agent_task_history(limit: int = 20,
+                           profile_uuid: str = None) -> List[Dict]:
+    """Lấy lịch sử agent tasks."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        if profile_uuid:
+            cursor.execute("""
+                SELECT l.*, s.name as skill_name
+                FROM agent_task_log l
+                LEFT JOIN agent_skills s ON l.matched_skill_id = s.id
+                WHERE l.profile_uuid = ?
+                ORDER BY l.created_at DESC LIMIT ?
+            """, (profile_uuid, limit))
+        else:
+            cursor.execute("""
+                SELECT l.*, s.name as skill_name
+                FROM agent_task_log l
+                LEFT JOIN agent_skills s ON l.matched_skill_id = s.id
+                ORDER BY l.created_at DESC LIMIT ?
+            """, (limit,))
+        return rows_to_list(cursor.fetchall())
 
 
 # Khởi tạo database khi import module

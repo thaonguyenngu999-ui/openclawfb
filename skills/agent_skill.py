@@ -23,6 +23,9 @@ from typing import Dict, Any, Optional, List
 
 import requests as _requests
 
+# DB for skill registry
+import db as _db
+
 # AI config
 _API_URL = "https://gen.pollinations.ai/v1/chat/completions"
 _API_KEY = "sk_3HRi9HUGLup7OKB6ykRds8YtnpcmLHD3"
@@ -144,6 +147,17 @@ class AgentSkill:
             except Exception as e:
                 print(f"[AGENT] Plan failed: {e}")
 
+            # ── Search for matching learned skills ──
+            matched_skills = self._search_matching_skills(task)
+            matched_skill_id = matched_skills[0]["id"] if matched_skills else None
+            skill_hint = self._build_skill_hint(matched_skills)
+            if skill_hint:
+                plan = plan + skill_hint
+                print(f"[AGENT] Injected {len(matched_skills)} skill hints into plan")
+
+            # ── Timing ──
+            _start_time = time.time()
+
             # ── Loop detection state ──
             last_actions = []   # track recent action strings
             last_dom_hash = ""  # track DOM changes
@@ -245,6 +259,33 @@ class AgentSkill:
             # Final summary
             ok_count = sum(1 for s in steps_log if s.get("ok"))
             last = steps_log[-1] if steps_log else {}
+            task_success = any(s.get("desc", "").startswith("DONE") for s in steps_log)
+            duration = time.time() - _start_time
+
+            # ── Auto-save skill & log task ──
+            try:
+                if task_success:
+                    self._auto_save_skill(task, steps_log, duration, matched_skill_id)
+                elif matched_skill_id:
+                    _db.increment_skill_fail(matched_skill_id)
+
+                _db.log_agent_task(
+                    profile_uuid=profile_uuid,
+                    task_text=task,
+                    matched_skill_id=matched_skill_id,
+                    steps_json=json.dumps(
+                        [{"s": s.get("step"), "ok": s.get("ok"),
+                          "d": s.get("desc", "")[:60]} for s in steps_log],
+                        ensure_ascii=False),
+                    success=task_success,
+                    total_steps=len(steps_log),
+                    duration=duration,
+                    error_message=last.get("desc", "") if not task_success else None,
+                )
+                print(f"[AGENT] Task logged: success={task_success}, "
+                      f"steps={len(steps_log)}, duration={duration:.1f}s")
+            except Exception as e:
+                print(f"[AGENT] Skill/log save error: {e}")
 
             if telegram_chat_id and telegram_message_id:
                 text = f"🤖 *Agent - {short_id}*\n📋 Task: {task[:60]}\n\n"
@@ -254,16 +295,21 @@ class AgentSkill:
                     text += f"❌ *Thất bại:* {last.get('desc', '')[8:]}\n\n"
                 else:
                     text += f"⚠️ {len(steps_log)} bước đã thực hiện\n\n"
-                text += f"📊 {ok_count}✅ / {len(steps_log)} steps"
+                skill_note = ""
+                if matched_skill_id:
+                    skill_note = f"🧠 Đã dùng skill đã học\n"
+                text += f"{skill_note}📊 {ok_count}✅ / {len(steps_log)} steps • {duration:.0f}s"
                 try:
                     self._telegram_edit_message(telegram_chat_id, telegram_message_id, text)
                 except Exception:
                     pass
 
             return {
-                "success": any(s.get("desc", "").startswith("DONE") for s in steps_log),
+                "success": task_success,
                 "profile_uuid": profile_uuid, "task": task,
                 "steps": steps_log, "total_steps": len(steps_log),
+                "duration": round(duration, 1),
+                "used_skill": matched_skill_id,
             }
 
         except Exception as e:
@@ -272,6 +318,124 @@ class AgentSkill:
             self._send_agent_screenshot(profile_uuid, telegram_chat_id,
                                          f"❌ Agent lỗi: {str(e)[:100]}")
             return {"success": False, "error": str(e), "steps": steps_log}
+
+    # ── Skill Registry: search & save learned procedures ──
+
+    def _extract_keywords(self, task: str) -> str:
+        """Extract meaningful keywords from task text for DB matching."""
+        stopwords = {
+            'vào', 'trên', 'của', 'và', 'hoặc', 'với', 'cho', 'để',
+            'từ', 'đến', 'các', 'một', 'những', 'là', 'có', 'không',
+            'được', 'đã', 'sẽ', 'đang', 'cái', 'này', 'kia', 'nào',
+            'thì', 'mà', 'nên', 'cần', 'tôi', 'mình', 'bạn', 'hãy',
+            'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of',
+            'and', 'or', 'is', 'my', 'me', 'go', 'do', 'it', 'về',
+        }
+        words = re.findall(r'[\w]+', task.lower())
+        keywords = [w for w in words if w not in stopwords and len(w) > 1]
+        return ",".join(keywords[:15])
+
+    def _classify_task(self, task: str) -> str:
+        """Classify task into a pattern category for skill matching."""
+        t = task.lower()
+        if any(w in t for w in ['viết bài', 'đăng bài', 'compose', 'post']):
+            return 'compose_post'
+        if any(w in t for w in ['like', 'thích']):
+            return 'like'
+        if any(w in t for w in ['comment', 'bình luận']):
+            return 'comment'
+        if any(w in t for w in ['thông báo', 'notification']):
+            return 'check_notifications'
+        if any(w in t for w in ['tin nhắn', 'message', 'messenger']):
+            return 'check_messages'
+        if any(w in t for w in ['bạn bè', 'friend', 'lời mời']):
+            return 'check_friends'
+        if any(w in t for w in ['nhóm', 'group']):
+            return 'interact_group'
+        if any(w in t for w in ['reel', 'reels', 'video ngắn']):
+            return 'watch_reels'
+        if any(w in t for w in ['xem', 'duyệt', 'feed', 'lướt']):
+            return 'browse_feed'
+        if any(w in t for w in ['marketplace', 'mua', 'bán']):
+            return 'marketplace'
+        if any(w in t for w in ['trang cá nhân', 'profile', '/me']):
+            return 'visit_profile'
+        return 'general'
+
+    def _search_matching_skills(self, task: str) -> List[Dict]:
+        """Search DB for previously learned skills matching this task."""
+        try:
+            skills = _db.search_agent_skills(task, limit=3)
+            if skills:
+                names = [s.get('name', '?') for s in skills]
+                print(f"[AGENT-SKILL] Found {len(skills)} matching skills: {names}")
+            return skills
+        except Exception as e:
+            print(f"[AGENT-SKILL] Search error: {e}")
+            return []
+
+    def _build_skill_hint(self, matched_skills: List[Dict]) -> str:
+        """Build a hint string from matched skills to inject into AI prompt."""
+        if not matched_skills:
+            return ""
+        hints = ["\n\n📚 KINH NGHIỆM TỪ TASK TƯƠNG TỰ ĐÃ THÀNH CÔNG:"]
+        for i, skill in enumerate(matched_skills[:2]):
+            name = skill.get("name", "?")
+            sc = skill.get("success_count", 0)
+            steps_str = skill.get("steps_json", "[]")
+            try:
+                steps = json.loads(steps_str)
+            except Exception:
+                steps = []
+            hints.append(f"\n--- Skill #{i+1}: '{name}' (đã thành công {sc} lần) ---")
+            for j, step in enumerate(steps[:8]):
+                desc = step.get("desc", "?")[:60]
+                hints.append(f"  Bước {j+1}: {desc}")
+            hints.append(f"  → Tổng {skill.get('total_steps', '?')} bước")
+        hints.append(
+            "\nBạn có thể LÀM THEO FLOW TƯƠNG TỰ nhưng KHÔNG bắt buộc. "
+            "Hãy adapt linh hoạt theo trang hiện tại."
+        )
+        return "\n".join(hints)
+
+    def _auto_save_skill(self, task: str, steps_log: List[Dict],
+                         duration: float, matched_skill_id: int = None):
+        """Auto-save successful procedure as a new skill or update existing."""
+        try:
+            # Only save if we have meaningful steps (not trivially short)
+            ok_steps = [s for s in steps_log if s.get("ok")]
+            if len(ok_steps) < 1:
+                return
+
+            task_pattern = self._classify_task(task)
+            keywords = self._extract_keywords(task)
+            name = f"{task_pattern}: {task[:50]}"
+
+            # Simplify steps for storage (only keep desc and ok)
+            simplified = []
+            for s in steps_log:
+                simplified.append({
+                    "step": s.get("step", 0),
+                    "ok": s.get("ok", False),
+                    "desc": s.get("desc", "")[:80],
+                })
+
+            result = _db.save_agent_skill(
+                name=name,
+                task_pattern=task_pattern,
+                keywords=keywords,
+                steps_json=json.dumps(simplified, ensure_ascii=False),
+                total_steps=len(steps_log),
+                duration=duration,
+            )
+
+            if result.get("updated"):
+                print(f"[AGENT-SKILL] Updated skill #{result['id']}: {name}")
+            else:
+                print(f"[AGENT-SKILL] Saved NEW skill #{result['id']}: {name}")
+
+        except Exception as e:
+            print(f"[AGENT-SKILL] Save error: {e}")
 
     # ── Screenshot via CDP (fast) ──
 
