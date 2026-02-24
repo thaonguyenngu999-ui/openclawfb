@@ -1,0 +1,14 @@
+{
+  "skill_name": "nút/menudropdown xuất hiện khi bấm 'Đã tham gia' (Joined) trong nhóm, sau đó chọn 'Rời nhóm' (Leave group)",
+  "target_desc": "nút/menudropdown xuất hiện khi bấm 'Đã tham gia' (Joined) trong nhóm, sau đó chọn 'Rời nhóm' (Leave group)",
+  "locator": {
+    "strategy": "text",
+    "stability": 0.3,
+    "locator": "div:has-text(\"Đáng chú ý6 mục mới Huy hiệu nội dung đáng chú ý\")",
+    "reason": "text"
+  },
+  "url_pattern": "/groups/1265215984015206",
+  "cached_at": "2026-02-24T15:44:17.520931",
+  "success_count": 1,
+  "fail_count": 0
+}

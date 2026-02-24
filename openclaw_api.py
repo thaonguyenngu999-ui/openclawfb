@@ -5,6 +5,7 @@ This file only contains the HTTP handler + routing + server startup.
 """
 
 import json
+import logging
 import os
 import threading
 import traceback
@@ -12,6 +13,11 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
 from skills import FBManagerAPI, SCREENSHOT_DIR
+
+logger = logging.getLogger(__name__)
+
+# Global cancel signal for batch operations (threading.Event for thread-safety)
+_cancel_batch_event = threading.Event()
 
 
 # HTTP Handler
@@ -23,8 +29,10 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'application/json')
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Connection', 'close')
+        body = json.dumps(data, ensure_ascii=False).encode('utf-8')
+        self.send_header('Content-Length', str(len(body)))
         self.end_headers()
-        self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+        self.wfile.write(body)
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -60,6 +68,9 @@ class APIHandler(BaseHTTPRequestHandler):
             else:
                 self._send_json({"error": "Screenshot not found"}, 404)
         elif path == '/screenshots':
+            if not os.path.isdir(SCREENSHOT_DIR):
+                self._send_json({"screenshots": [], "total": 0})
+                return
             files = sorted(os.listdir(SCREENSHOT_DIR), reverse=True)[:50]
             screenshots = []
             for f in files:
@@ -84,7 +95,8 @@ class APIHandler(BaseHTTPRequestHandler):
 
         try:
             params = json.loads(body) if body else {}
-        except:
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"Invalid JSON in request body: {e}")
             params = {}
 
         parsed = urlparse(self.path)
@@ -92,7 +104,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Endpoints that manage their own concurrency
         no_lock_paths = {'/list_profiles', '/list_folders', '/wait', '/send_telegram_photo',
-                         '/check_fb_batch', '/check_fb_status',
+                         '/check_fb_batch', '/check_fb_status', '/cancel_batch',
                          '/fb_nurture_batch', '/vision_skills', '/vision_clear_skills',
                          '/agent_execute', '/agent_skills', '/agent_task_history',
                          '/agent_skill_delete', '/delete_profiles',
@@ -108,7 +120,15 @@ class APIHandler(BaseHTTPRequestHandler):
             if path in no_lock_paths:
                 result = self._handle_post(path, params)
             else:
+                # Resolve profile name → UUID BEFORE acquiring lock (so lock key is consistent)
                 profile_uuid = params.get('profile_uuid') or params.get('profile')
+                if profile_uuid:
+                    profile_uuid = self.fb_api.resolve_profile(profile_uuid)
+                    # Update params so _handle_post doesn't re-resolve
+                    if 'profile_uuid' in params:
+                        params['profile_uuid'] = profile_uuid
+                    if 'profile' in params:
+                        params['profile'] = profile_uuid
                 lock = self.fb_api._get_profile_lock(profile_uuid)
                 with lock:
                     result = self._handle_post(path, params)
@@ -238,7 +258,14 @@ class APIHandler(BaseHTTPRequestHandler):
             close_after = params.get('close_after', True)
             return self.fb_api.check_fb_status(profile_uuid, close_after=close_after)
 
+        elif path == '/cancel_batch':
+            _cancel_batch_event.set()
+            logger.info("🛑 /cancel_batch: signal SET — batch operations will stop")
+            return {"success": True, "message": "Cancel signal sent to all batch operations"}
+
         elif path == '/check_fb_batch':
+            # Clear cancel signal at start of new batch
+            _cancel_batch_event.clear()
             profile_uuids = params.get('profile_uuids') or params.get('profiles', [])
             if not profile_uuids:
                 return {"error": "profile_uuids required (list of uuids or names)"}
@@ -260,9 +287,13 @@ class APIHandler(BaseHTTPRequestHandler):
             if tg_chat_id and tg_msg_id and tg_token:
                 import requests as tg_req
                 last_update = [0]
-                def progress_cb(checked, total, summary, last_uuid, last_status):
+                error_details = []  # Track last few error details
+                def progress_cb(checked, total, summary, last_uuid, last_status, last_detail=''):
                     import time as t
                     now = t.time()
+                    # Track errors with details
+                    if last_status in ('ERROR', 'UNKNOWN') and last_detail:
+                        error_details.append(f"{name_map.get(last_uuid, last_uuid[:12])}: {last_detail[:40]}")
                     # Throttle: update every 3 seconds
                     if now - last_update[0] < 3 and checked < total:
                         return
@@ -270,17 +301,27 @@ class APIHandler(BaseHTTPRequestHandler):
                     name = name_map.get(last_uuid, last_uuid[:20])
                     live = summary.get('LIVE', 0)
                     die = summary.get('DIE', 0) + summary.get('NOT_LOGGED_IN', 0)
-                    err = summary.get('ERROR', 0)
+                    err = summary.get('ERROR', 0) + summary.get('UNKNOWN', 0)
                     locked = summary.get('LOCKED', 0) + summary.get('2FA', 0)
                     status_icon = {'LIVE': '✅', 'DIE': '❌', 'ERROR': '⚠️',
-                                   'LOCKED': '🔒', '2FA': '🔒', 'NOT_LOGGED_IN': '❌'}.get(last_status, '❓')
+                                   'LOCKED': '🔒', '2FA': '🔒', 'NOT_LOGGED_IN': '❌',
+                                   'UNKNOWN': '❓'}.get(last_status, '❓')
+                    # Show detail for errors
+                    status_text = last_status
+                    if last_status in ('ERROR', 'UNKNOWN') and last_detail:
+                        status_text = f"{last_status}: {last_detail[:50]}"
                     text = (f"🔍 Checking... {checked}/{total}\n"
-                            f"{status_icon} {name} → {last_status}\n\n"
+                            f"{status_icon} {name} → {status_text}\n\n"
                             f"✅ Live: {live}  ❌ Die: {die}")
                     if locked:
                         text += f"  🔒 Lock: {locked}"
                     if err:
                         text += f"  ⚠️ Err: {err}"
+                        # Show last 2 error reasons
+                        if error_details:
+                            text += f"\n\n⚠️ Lỗi gần nhất:\n"
+                            for ed in error_details[-2:]:
+                                text += f"• {ed}\n"
                     try:
                         tg_req.post(
                             f"https://api.telegram.org/bot{tg_token}/editMessageText",
@@ -292,7 +333,8 @@ class APIHandler(BaseHTTPRequestHandler):
 
             result = self.fb_api.check_fb_batch(resolved, close_after=close_after,
                                                max_workers=max_workers,
-                                               progress_callback=progress_cb)
+                                               progress_callback=progress_cb,
+                                               cancel_event=_cancel_batch_event)
             # Add original names back to results
             if 'results' in result:
                 for r in result['results']:
@@ -373,39 +415,34 @@ class APIHandler(BaseHTTPRequestHandler):
                     if f_str.isdigit():
                         resolved.append(int(f_str))
                         continue
-                    # Try static map first (fb1→1, etc)
-                    STATIC_MAP = {
-                        'fb1': 1, 'fb2': 2, 'fb3': 6, 'fb5': 5, 'fb6': 6, 'fb7': 7,
-                    }
+                    # Dynamic lookup: fetch folders and match by name (always fresh)
                     f_lower = f_str.lower()
-                    if f_lower in STATIC_MAP:
-                        resolved.append(STATIC_MAP[f_lower])
-                        continue
-                    # Dynamic lookup: fetch folders and match by name
                     try:
                         from api_service import api as hidemium
                         all_folders = hidemium.get_folders(limit=100)
                         matched = None
+                        # Exact match first (case-insensitive)
                         for fld in all_folders:
                             fname = fld.get('name', '').lower().strip()
                             if fname == f_lower or fname.replace(' ', '') == f_lower.replace(' ', ''):
                                 matched = fld.get('id')
                                 break
-                        if matched:
-                            resolved.append(matched)
-                        else:
-                            # Partial match
+                        # Partial match fallback
+                        if not matched:
                             for fld in all_folders:
                                 fname = fld.get('name', '').lower().strip()
                                 if f_lower in fname or fname in f_lower:
                                     matched = fld.get('id')
                                     break
-                            if matched:
-                                resolved.append(matched)
-                            else:
-                                resolved.append(f)  # pass as-is, let Hidemium handle
-                    except Exception:
+                        if matched:
+                            resolved.append(matched)
+                            logger.info(f"Folder resolved: '{f_str}' → id={matched}")
+                        else:
+                            resolved.append(f)  # pass as-is, let Hidemium handle
+                            logger.warning(f"Folder NOT resolved: '{f_str}', passing as-is")
+                    except Exception as e:
                         resolved.append(f)
+                        logger.warning(f"Folder resolve error for '{f_str}': {e}")
                 folder_id = resolved
             try:
                 import requests as req
@@ -515,10 +552,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 telegram_message_id = int(telegram_message_id)
             if not task:
                 return {"error": "task is required"}
+            _cancel_batch_event.clear()
             return self.fb_api.agent_execute(
                 task=task, profile_uuid=profile_uuid,
                 telegram_chat_id=telegram_chat_id,
-                telegram_message_id=telegram_message_id)
+                telegram_message_id=telegram_message_id,
+                cancel_event=_cancel_batch_event)
 
         elif path == '/agent_skills':
             import db as _db

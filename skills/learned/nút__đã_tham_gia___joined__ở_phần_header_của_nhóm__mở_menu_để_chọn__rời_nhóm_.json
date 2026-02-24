@@ -1,0 +1,14 @@
+{
+  "skill_name": "Nút \"Đã tham gia\" (Joined) ở phần header của nhóm, mở menu để chọn \"Rời nhóm\"",
+  "target_desc": "Nút \"Đã tham gia\" (Joined) ở phần header của nhóm, mở menu để chọn \"Rời nhóm\"",
+  "locator": {
+    "strategy": "text",
+    "stability": 0.3,
+    "locator": "div:has-text(\"Rời nhóm\")",
+    "reason": "text"
+  },
+  "url_pattern": "/groups/394976008926101",
+  "cached_at": "2026-02-24T15:48:22.592584",
+  "success_count": 1,
+  "fail_count": 0
+}

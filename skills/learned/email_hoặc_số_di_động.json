@@ -1,0 +1,14 @@
+{
+  "skill_name": "Email hoặc số di động",
+  "target_desc": "Email hoặc số di động",
+  "locator": {
+    "strategy": "text",
+    "stability": 0.3,
+    "locator": "div:has-text(\"Email hoặc số di độngMật khẩuĐăng nhậpQuên mật khẩ\")",
+    "reason": "text"
+  },
+  "url_pattern": "/",
+  "cached_at": "2026-02-23T23:28:20.056756",
+  "success_count": 1,
+  "fail_count": 0
+}

@@ -1,0 +1,14 @@
+{
+  "skill_name": "Đã tham gia",
+  "target_desc": "Đã tham gia",
+  "locator": {
+    "strategy": "css",
+    "stability": 0.4,
+    "locator": "div[role=\"main\"][aria-label=\"Bản xem trước nhóm\"] > div > div > div[role=\"main\"]",
+    "reason": "path"
+  },
+  "url_pattern": "/groups/1265215984015206",
+  "cached_at": "2026-02-24T13:55:50.416785",
+  "success_count": 1,
+  "fail_count": 0
+}

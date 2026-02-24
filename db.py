@@ -331,7 +331,21 @@ def init_database():
             )
         """)
 
+        # ============ AGENT MEMORY TABLE (persistent across sessions) ============
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_uuid TEXT NOT NULL,
+                memory_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                task_context TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Tạo indexes để tăng tốc query
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_memory_profile ON agent_memory(profile_uuid)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_memory_type ON agent_memory(memory_type)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_skills_keywords ON agent_skills(keywords)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_task_log_task ON agent_task_log(task_text)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_task_log_skill ON agent_task_log(matched_skill_id)")
@@ -1836,6 +1850,54 @@ def get_agent_task_history(limit: int = 20,
                 ORDER BY l.created_at DESC LIMIT ?
             """, (limit,))
         return rows_to_list(cursor.fetchall())
+
+
+# ============ AGENT PERSISTENT MEMORY ============
+
+def save_agent_memory(profile_uuid: str, memory_type: str,
+                      content: str, task_context: str = None):
+    """Lưu 1 memory entry cho agent (persistent qua sessions).
+    memory_type: 'lesson' | 'page_knowledge' | 'error_pattern' | 'strategy'"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO agent_memory (profile_uuid, memory_type, content, task_context)
+            VALUES (?, ?, ?, ?)
+        """, (profile_uuid, memory_type, content, task_context))
+
+
+def get_agent_memories(profile_uuid: str, memory_type: str = None,
+                       limit: int = 20) -> List[Dict]:
+    """Lấy memories của agent cho profile. Có thể filter theo type."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        if memory_type:
+            cursor.execute("""
+                SELECT * FROM agent_memory
+                WHERE profile_uuid = ? AND memory_type = ?
+                ORDER BY created_at DESC LIMIT ?
+            """, (profile_uuid, memory_type, limit))
+        else:
+            cursor.execute("""
+                SELECT * FROM agent_memory
+                WHERE profile_uuid = ?
+                ORDER BY created_at DESC LIMIT ?
+            """, (profile_uuid, limit))
+        return rows_to_list(cursor.fetchall())
+
+
+def clear_old_agent_memories(profile_uuid: str, keep_last: int = 50):
+    """Xóa memories cũ, giữ lại N mới nhất."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            DELETE FROM agent_memory
+            WHERE profile_uuid = ? AND id NOT IN (
+                SELECT id FROM agent_memory
+                WHERE profile_uuid = ?
+                ORDER BY created_at DESC LIMIT ?
+            )
+        """, (profile_uuid, profile_uuid, keep_last))
 
 
 # Khởi tạo database khi import module

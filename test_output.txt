@@ -1,0 +1,11 @@
+﻿C:\Users\V\Desktop\fb_manager_pro\.venv\Scripts\python.exe : C:\Program 
+Files\Python312\python.exe: can't open file 
+'C:\\Users\\V\\Desktop\\fb_manager_pro\\test_grok.py': [Errno 2] No such file 
+or directory
+At line:1 char:154
++ ... oding utf8; C:\Users\V\Desktop\fb_manager_pro\.venv\Scripts\python.ex ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Program File...le or directory 
+   :String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

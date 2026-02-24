@@ -19,7 +19,7 @@ class HidemiumAPI:
         }
 
     def _request(self, method: str, endpoint: str, params: Dict = None, data: Dict = None) -> Dict:
-        """Thực hiện request đến API với Bearer token"""
+        """Đảm bảo request đến API với Bearer token, kiểm tra HTTP status"""
         url = f"{self.base_url}{endpoint}"
 
         try:
@@ -31,19 +31,29 @@ class HidemiumAPI:
                 json=data,
                 timeout=30
             )
-            return response.json()
+            if response.status_code >= 400:
+                return {"type": "error", "title": f"HTTP {response.status_code}", "content": response.text[:300]}
+            try:
+                return response.json()
+            except ValueError:
+                return {"type": "error", "title": "Invalid JSON response", "content": response.text[:300]}
         except requests.exceptions.ConnectionError:
             return {"type": "error", "title": "Không thể kết nối đến Hidemium", "content": None}
         except Exception as e:
             return {"type": "error", "title": str(e), "content": None}
 
     def _get(self, endpoint: str, params: Dict = None) -> Dict:
-        """GET request với Bearer token"""
+        """GET request với Bearer token, kiểm tra HTTP status"""
         url = f"{self.base_url}{endpoint}"
 
         try:
             response = requests.get(url, headers=self.headers, params=params, timeout=30)
-            return response.json()
+            if response.status_code >= 400:
+                return {"type": "error", "title": f"HTTP {response.status_code}", "content": response.text[:300]}
+            try:
+                return response.json()
+            except ValueError:
+                return {"type": "error", "title": "Invalid JSON response", "content": response.text[:300]}
         except requests.exceptions.ConnectionError:
             return {"type": "error", "title": "Không thể kết nối đến Hidemium", "content": None}
         except Exception as e:
@@ -290,11 +300,17 @@ class HidemiumAPI:
 
             def send_cmd(method, params=None):
                 msg_id[0] += 1
-                msg = {"id": msg_id[0], "method": method}
+                cur_id = msg_id[0]
+                msg = {"id": cur_id, "method": method}
                 if params:
                     msg["params"] = params
                 ws.send(json_module.dumps(msg))
-                return json_module.loads(ws.recv())
+                for _ in range(200):
+                    raw = ws.recv()
+                    resp = json_module.loads(raw)
+                    if resp.get("id") == cur_id:
+                        return resp
+                return {}
 
             # Get window bounds from slot
             x, y, w, h = get_window_bounds(slot_id)
@@ -315,7 +331,7 @@ class HidemiumAPI:
                 print(f"[API] setWindowBounds: {bounds_result}")
 
                 if 'error' not in bounds_result:
-                    print(f"[API] ✓ Window positioned at ({x}, {y})")
+                    print(f"[API] OK Window positioned at ({x}, {y})")
                 else:
                     print(f"[API] ERROR: {bounds_result.get('error')}")
 

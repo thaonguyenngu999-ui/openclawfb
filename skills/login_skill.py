@@ -289,11 +289,17 @@ class LoginSkill:
             msg_id = [0]
             def send_cmd(method, params=None):
                 msg_id[0] += 1
-                msg = {"id": msg_id[0], "method": method}
+                cur_id = msg_id[0]
+                msg = {"id": cur_id, "method": method}
                 if params:
                     msg["params"] = params
                 ws.send(json.dumps(msg))
-                return json.loads(ws.recv())
+                for _ in range(200):
+                    raw = ws.recv()
+                    resp = json.loads(raw)
+                    if resp.get("id") == cur_id:
+                        return resp
+                return {}
 
             def evaluate(expression):
                 r = send_cmd("Runtime.evaluate", {
@@ -357,6 +363,19 @@ class LoginSkill:
 
             screenshot_path = self._capture_screenshot(send_cmd, profile_uuid, f'check_{status_clean}')
 
+            # Extract c_user cookie (FB UID) via CDP
+            fb_uid = None
+            try:
+                cookies_resp = send_cmd("Network.getCookies", {"urls": ["https://www.facebook.com"]})
+                cookies = cookies_resp.get('result', {}).get('cookies', [])
+                for ck in cookies:
+                    if ck.get('name') == 'c_user':
+                        fb_uid = ck.get('value')
+                        print(f"[CHECK] {short_id} → c_user (FB UID): {fb_uid}")
+                        break
+            except Exception as ce:
+                print(f"[CHECK] {short_id} → Cookie extraction failed: {ce}")
+
             result_data = {
                 "success": True,
                 "status": status_clean,
@@ -364,6 +383,8 @@ class LoginSkill:
                 "profile_uuid": profile_uuid,
                 "remote_port": remote_port
             }
+            if fb_uid:
+                result_data["fb_uid"] = fb_uid
             if screenshot_path:
                 result_data["screenshot"] = screenshot_path
                 result_data["screenshot_url"] = f"http://127.0.0.1:8899/screenshots/{os.path.basename(screenshot_path)}"
@@ -379,6 +400,15 @@ class LoginSkill:
                 "profile_uuid": profile_uuid
             }
         finally:
+            # Graceful shutdown via CDP Browser.close() to flush cookies
+            if ws and close_after:
+                try:
+                    msg_id[0] += 1
+                    ws.send(json.dumps({"id": msg_id[0], "method": "Browser.close"}))
+                    print(f"[CHECK] {short_id} → Sent Browser.close()")
+                    time.sleep(3)
+                except Exception:
+                    pass
             if ws:
                 try:
                     ws.close()
@@ -393,16 +423,19 @@ class LoginSkill:
 
     def check_fb_batch(self, profile_uuids: List[str], close_after: bool = True,
                         max_workers: int = 5,
-                        progress_callback=None) -> Dict[str, Any]:
+                        progress_callback=None,
+                        cancel_event=None) -> Dict[str, Any]:
         """
         Check nhiều profiles SONG SONG (parallel).
         progress_callback(checked, total, summary, last_name, last_status) called after each profile.
+        cancel_event: threading.Event — if set, stop processing and cancel remaining futures.
         Returns: {success, results, summary: {LIVE:n, DIE:n,...}}
         """
         results_map = {}
         summary = {}
         checked_count = [0]
         lock = threading.Lock()
+        cancelled = False
 
         workers = min(max_workers, len(profile_uuids))
         total = len(profile_uuids)
@@ -414,9 +447,19 @@ class LoginSkill:
                 for uuid in profile_uuids
             }
             for future in as_completed(future_to_uuid):
+                # Check cancel signal BEFORE processing result
+                if cancel_event and cancel_event.is_set():
+                    print(f"[API] check_fb_batch: CANCEL signal received — stopping")
+                    cancelled = True
+                    # Cancel remaining futures
+                    for f in future_to_uuid:
+                        if not f.done():
+                            f.cancel()
+                    break
+
                 uuid = future_to_uuid[future]
                 try:
-                    result = future.result(timeout=120)
+                    result = future.result(timeout=180)
                 except Exception as e:
                     result = {
                         "success": False, "status": "ERROR",
@@ -424,15 +467,16 @@ class LoginSkill:
                     }
                 results_map[uuid] = result
                 s = result.get('status', 'ERROR')
-                summary[s] = summary.get(s, 0) + 1
                 with lock:
+                    summary[s] = summary.get(s, 0) + 1
                     checked_count[0] += 1
                     count = checked_count[0]
                 print(f"[API] check_fb_batch: [{count}/{total}] {uuid[:20]}... → {s}")
-                # Call progress callback
+                # Call progress callback with detail
+                detail = result.get('detail', '')
                 if progress_callback:
                     try:
-                        progress_callback(count, total, dict(summary), uuid, s)
+                        progress_callback(count, total, dict(summary), uuid, s, detail)
                     except Exception as e:
                         print(f"[API] progress_callback error: {e}")
 
@@ -441,6 +485,8 @@ class LoginSkill:
         return {
             "success": True,
             "total": len(profile_uuids),
+            "checked": len(results_map),
+            "cancelled": cancelled,
             "results": results,
             "summary": summary,
             "parallel": True,
@@ -460,7 +506,9 @@ class LoginSkill:
         ws = None
         remote_port = None
         try:
+            print(f"[LOGIN] Opening browser for {profile_uuid[:20]}... fb_id={fb_id}")
             result = hidemium.open_browser(profile_uuid)
+            print(f"[LOGIN] open_browser result: {result}")
             if result.get('type') == 'error':
                 msg = result.get('message', 'Unknown error')
                 if 'already' in msg.lower():
@@ -514,11 +562,17 @@ class LoginSkill:
             msg_id = [0]
             def send_cmd(method, params=None):
                 msg_id[0] += 1
-                msg = {"id": msg_id[0], "method": method}
+                cur_id = msg_id[0]
+                msg = {"id": cur_id, "method": method}
                 if params:
                     msg["params"] = params
                 ws.send(json.dumps(msg))
-                return json.loads(ws.recv())
+                for _ in range(200):
+                    raw = ws.recv()
+                    resp = json.loads(raw)
+                    if resp.get("id") == cur_id:
+                        return resp
+                return {}
 
             def evaluate(expression):
                 r = send_cmd("Runtime.evaluate", {
@@ -540,75 +594,312 @@ class LoginSkill:
                     send_cmd("Input.insertText", {"text": char})
                     time.sleep(random.uniform(0.10, 0.28))
 
-            # Xóa cookies Facebook cũ
-            for domain in [".facebook.com", "facebook.com", "www.facebook.com"]:
-                send_cmd("Network.deleteCookies", {"domain": domain})
+            # Xóa cookies + storage Facebook cũ trước khi login
+            # Dùng Storage.clearDataForOrigin để xóa cookies theo origin (đúng spec CDP)
             for origin in ["https://www.facebook.com", "https://m.facebook.com"]:
-                send_cmd("Storage.clearDataForOrigin", {"origin": origin, "storageTypes": "all"})
+                send_cmd("Storage.clearDataForOrigin", {"origin": origin, "storageTypes": "cookies,local_storage,session_storage,indexeddb"})
 
-            send_cmd("Page.navigate", {"url": "https://www.facebook.com/login"})
-            time.sleep(3)
+            print(f"[LOGIN] Navigating to facebook.com/login...")
+            nav_result = send_cmd("Page.navigate", {"url": "https://www.facebook.com/login"})
+            print(f"[LOGIN] Navigate result: {nav_result}")
+            time.sleep(4)
 
-            for _ in range(10):
+            for i in range(15):
                 ready = evaluate('document.readyState')
+                print(f"[LOGIN] readyState attempt {i}: {ready}")
                 if ready == 'complete':
                     break
                 time.sleep(1)
 
-            # Xử lý "Không phải bạn?"
-            not_you = evaluate('''
-                (function() {
-                    let els = document.querySelectorAll('a, div[role="button"], span, button');
-                    for (let el of els) {
-                        let text = (el.innerText || el.textContent || '').trim();
-                        if (text.includes('Không phải bạn') || text.includes('Not you') ||
-                            text.includes('Log in with another') || text.includes('Đăng nhập bằng tài khoản khác')) {
-                            el.click();
-                            return 'clicked';
+            # ========== PHASE 1: CHECK DOM/HTML — tìm selector động ==========
+            # Lấy HTML thực tế của trang để phân tích, không hardcode selector
+            dom_info = None
+            email_sel = None
+            pass_sel = None
+            btn_sel = None
+
+            for _dom_retry in range(8):
+                dom_info = evaluate(r'''
+                    (function() {
+                        var url = window.location.href || '';
+                        var title = document.title || '';
+                        var html = document.documentElement.outerHTML || '';
+
+                        // Tìm tất cả input fields trên trang
+                        var inputs = document.querySelectorAll('input');
+                        var inputDetails = [];
+                        for (var i = 0; i < inputs.length; i++) {
+                            var inp = inputs[i];
+                            var rect = inp.getBoundingClientRect();
+                            inputDetails.push({
+                                tag: 'input',
+                                id: inp.id || '',
+                                name: inp.name || '',
+                                type: (inp.type || 'text').toLowerCase(),
+                                placeholder: inp.placeholder || '',
+                                ariaLabel: inp.getAttribute('aria-label') || '',
+                                className: inp.className || '',
+                                visible: rect.width > 0 && rect.height > 0,
+                                dataTestid: inp.getAttribute('data-testid') || ''
+                            });
                         }
-                    }
-                    return 'no_session';
-                })()
-            ''')
-            if not_you and 'clicked' in str(not_you):
-                time.sleep(2)
 
-            form_check = evaluate('''
-                (function() {
-                    let email = document.querySelector('#email');
-                    let pass = document.querySelector('#pass');
-                    return email && pass ? 'OK' : 'NO_FORM';
-                })()
-            ''')
+                        // Tìm tất cả buttons
+                        var btns = document.querySelectorAll('button, input[type="submit"], div[role="button"]');
+                        var btnDetails = [];
+                        for (var j = 0; j < btns.length; j++) {
+                            var b = btns[j];
+                            var brect = b.getBoundingClientRect();
+                            btnDetails.push({
+                                tag: b.tagName.toLowerCase(),
+                                id: b.id || '',
+                                name: b.name || '',
+                                type: (b.type || '').toLowerCase(),
+                                text: (b.innerText || b.textContent || b.value || '').trim().substring(0, 50),
+                                ariaLabel: b.getAttribute('aria-label') || '',
+                                dataTestid: b.getAttribute('data-testid') || '',
+                                visible: brect.width > 0 && brect.height > 0
+                            });
+                        }
 
-            if form_check != 'OK':
+                        // Xử lý "Không phải bạn?" / "Not you?"
+                        var notYou = false;
+                        var links = document.querySelectorAll('a, div[role="button"], span, button');
+                        for (var k = 0; k < links.length; k++) {
+                            var txt = (links[k].innerText || links[k].textContent || '').trim();
+                            if (txt.indexOf('Kh\u00f4ng ph\u1ea3i b\u1ea1n') >= 0 || txt.indexOf('Not you') >= 0 ||
+                                txt.indexOf('Log in with another') >= 0 || txt.indexOf('\u0110\u0103ng nh\u1eadp b\u1eb1ng t\u00e0i kho\u1ea3n kh\u00e1c') >= 0) {
+                                links[k].click();
+                                notYou = true;
+                                break;
+                            }
+                        }
+
+                        return JSON.stringify({
+                            url: url,
+                            title: title,
+                            htmlLen: html.length,
+                            inputCount: inputs.length,
+                            inputs: inputDetails,
+                            btnCount: btns.length,
+                            buttons: btnDetails,
+                            notYouClicked: notYou
+                        });
+                    })()
+                ''')
+                print(f"[LOGIN] DOM check attempt {_dom_retry}: {str(dom_info)[:500]}")
+
+                if not dom_info:
+                    time.sleep(2)
+                    continue
+
+                try:
+                    dom = json.loads(dom_info)
+                except Exception:
+                    time.sleep(2)
+                    continue
+
+                # Nếu click "Không phải bạn" thì đợi trang reload
+                if dom.get('notYouClicked'):
+                    print("[LOGIN] Clicked 'Not you' button, waiting for reload...")
+                    time.sleep(3)
+                    continue
+
+                inputs_list = dom.get('inputs', [])
+                buttons_list = dom.get('buttons', [])
+
+                print(f"[LOGIN] URL: {dom.get('url')}, Title: {dom.get('title')}, "
+                      f"Inputs: {len(inputs_list)}, Buttons: {len(buttons_list)}")
+
+                # ---- Tìm email/uid field ----
+                for inp in inputs_list:
+                    if not inp.get('visible'):
+                        continue
+                    # Ưu tiên: id='email', name='email', type='email'
+                    if inp.get('id') == 'email' or inp.get('name') == 'email':
+                        email_sel = '#email' if inp.get('id') == 'email' else 'input[name="email"]'
+                        break
+                    if inp.get('type') == 'email':
+                        if inp.get('id'):
+                            email_sel = f"#{inp['id']}"
+                        elif inp.get('name'):
+                            email_sel = f"input[name=\"{inp['name']}\"]"
+                        else:
+                            email_sel = 'input[type="email"]'
+                        break
+                    # data-testid chứa 'email' hoặc 'username'
+                    dt = inp.get('dataTestid', '').lower()
+                    if 'email' in dt or 'username' in dt or 'login' in dt:
+                        if inp.get('id'):
+                            email_sel = f"#{inp['id']}"
+                        else:
+                            email_sel = f'input[data-testid="{inp["dataTestid"]}"]'
+                        break
+                    # placeholder / aria-label chứa email/phone/số điện thoại
+                    ph = (inp.get('placeholder', '') + ' ' + inp.get('ariaLabel', '')).lower()
+                    if any(kw in ph for kw in ['email', 'phone', 'mobile', 'username',
+                                                'so dien thoai', 'dia chi email',
+                                                'email address', 'số điện thoại']):
+                        if inp.get('id'):
+                            email_sel = f"#{inp['id']}"
+                        elif inp.get('name'):
+                            email_sel = f"input[name=\"{inp['name']}\"]"
+                        else:
+                            email_sel = f"input[placeholder=\"{inp.get('placeholder')}\"]"
+                        break
+
+                # Nếu chưa tìm được, fallback: input[type=text] visible đầu tiên
+                if not email_sel:
+                    for inp in inputs_list:
+                        if inp.get('visible') and inp.get('type') in ('text', 'tel', ''):
+                            if inp.get('id'):
+                                email_sel = f"#{inp['id']}"
+                            elif inp.get('name'):
+                                email_sel = f"input[name=\"{inp['name']}\"]"
+                            else:
+                                email_sel = f"input[type=\"{inp.get('type', 'text')}\"]"
+                            break
+
+                # ---- Tìm password field ----
+                for inp in inputs_list:
+                    if not inp.get('visible'):
+                        continue
+                    if inp.get('id') == 'pass' or inp.get('name') == 'pass':
+                        pass_sel = '#pass' if inp.get('id') == 'pass' else 'input[name="pass"]'
+                        break
+                    if inp.get('type') == 'password':
+                        if inp.get('id'):
+                            pass_sel = f"#{inp['id']}"
+                        elif inp.get('name'):
+                            pass_sel = f"input[name=\"{inp['name']}\"]"
+                        else:
+                            pass_sel = 'input[type="password"]'
+                        break
+
+                # ---- Tìm login button ----
+                for btn in buttons_list:
+                    if not btn.get('visible'):
+                        continue
+                    # id='loginbutton' hoặc name='login'
+                    if btn.get('id') == 'loginbutton':
+                        btn_sel = '#loginbutton'
+                        break
+                    if btn.get('name') == 'login':
+                        btn_sel = 'button[name="login"]'
+                        break
+                    # data-testid chứa 'login'
+                    dt = btn.get('dataTestid', '').lower()
+                    if 'login' in dt or 'submit' in dt:
+                        btn_sel = f'[data-testid="{btn["dataTestid"]}"]'
+                        break
+                    # text chứa 'Log in', 'Đăng nhập', 'Sign in'
+                    txt = btn.get('text', '').lower()
+                    if any(kw in txt for kw in ['log in', 'login', 'dang nhap',
+                                                 'đăng nhập', 'sign in']):
+                        if btn.get('id'):
+                            btn_sel = f"#{btn['id']}"
+                        elif btn.get('name'):
+                            btn_sel = f"button[name=\"{btn['name']}\"]"
+                        elif btn.get('dataTestid'):
+                            btn_sel = f'[data-testid="{btn["dataTestid"]}"]'
+                        else:
+                            # Dùng text match
+                            btn_sel = f'__TEXT_MATCH__:{txt}'
+                        break
+
+                # Nếu chưa tìm btn, fallback: button[type=submit]
+                if not btn_sel:
+                    for btn in buttons_list:
+                        if btn.get('visible') and btn.get('type') == 'submit':
+                            if btn.get('id'):
+                                btn_sel = f"#{btn['id']}"
+                            else:
+                                btn_sel = 'button[type="submit"]'
+                            break
+
+                print(f"[LOGIN] Detected selectors: email={email_sel}, pass={pass_sel}, btn={btn_sel}")
+
+                if email_sel and pass_sel:
+                    break  # Tìm được cả 2 field → tiến hành login
+                else:
+                    # Reset cho retry tiếp
+                    email_sel = None
+                    pass_sel = None
+                    btn_sel = None
+                    time.sleep(2)
+
+            # ========== PHASE 2: Kiểm tra kết quả DOM check ==========
+            if not email_sel or not pass_sel:
+                # Lấy thêm HTML snippet để debug
+                html_snippet = evaluate('document.documentElement.outerHTML.substring(0, 3000)') or 'N/A'
+                print(f"[LOGIN] FAILED - No form found. HTML snippet: {str(html_snippet)[:1000]}")
                 return {
                     "success": False, "status": "ERROR",
-                    "detail": "Không tìm thấy form đăng nhập",
+                    "detail": f"Khong tim thay form dang nhap. URL={dom.get('url','?')}, "
+                              f"inputs={dom.get('inputCount',0)}, title={dom.get('title','?')}",
                     "profile_uuid": profile_uuid, "fb_id": fb_id
                 }
 
-            type_text(fb_id, "#email")
+            # ========== PHASE 3: Nhập UID + Password dùng selector động ==========
+            print(f"[LOGIN] Typing fb_id into {email_sel}...")
+            type_text(fb_id, email_sel)
             time.sleep(random.uniform(0.3, 0.7))
-            type_text(password, "#pass")
+
+            print(f"[LOGIN] Typing password into {pass_sel}...")
+            type_text(password, pass_sel)
             time.sleep(random.uniform(0.5, 1.0))
 
-            login_click = evaluate('''
-                (function() {
-                    let loginBtn = document.querySelector('#loginbutton') ||
-                                   document.querySelector('button[name="login"]') ||
-                                   document.querySelector('button[type="submit"]');
-                    if (loginBtn) { loginBtn.click(); return 'CLICKED'; }
-                    let form = document.querySelector('#email')?.closest('form');
-                    if (form) { form.submit(); return 'SUBMITTED'; }
-                    return 'NO_BTN';
-                })()
-            ''')
+            # ========== PHASE 4: Click login button ==========
+            if btn_sel and btn_sel.startswith('__TEXT_MATCH__:'):
+                # Text-based button match
+                match_text = btn_sel.split(':', 1)[1]
+                login_click = evaluate(f'''
+                    (function() {{
+                        var btns = document.querySelectorAll('button, div[role="button"], input[type="submit"]');
+                        for (var i = 0; i < btns.length; i++) {{
+                            var t = (btns[i].innerText || btns[i].textContent || btns[i].value || '').trim().toLowerCase();
+                            if (t.indexOf("{match_text}") >= 0) {{
+                                btns[i].click();
+                                return 'CLICKED';
+                            }}
+                        }}
+                        return 'NO_BTN';
+                    }})()
+                ''')
+            elif btn_sel:
+                login_click = evaluate(f'''
+                    (function() {{
+                        var btn = document.querySelector('{btn_sel}');
+                        if (btn) {{ btn.click(); return 'CLICKED'; }}
+                        return 'NO_BTN';
+                    }})()
+                ''')
+            else:
+                # Fallback: submit form chứa email field
+                login_click = evaluate(f'''
+                    (function() {{
+                        var emailEl = document.querySelector('{email_sel}');
+                        if (emailEl) {{
+                            var form = emailEl.closest('form');
+                            if (form) {{ form.submit(); return 'SUBMITTED'; }}
+                        }}
+                        // Last resort: press Enter
+                        var passEl = document.querySelector('{pass_sel}');
+                        if (passEl) {{
+                            passEl.dispatchEvent(new KeyboardEvent('keydown', {{key:'Enter', code:'Enter', keyCode:13, bubbles:true}}));
+                            passEl.dispatchEvent(new KeyboardEvent('keyup', {{key:'Enter', code:'Enter', keyCode:13, bubbles:true}}));
+                            return 'ENTER_PRESSED';
+                        }}
+                        return 'NO_BTN';
+                    }})()
+                ''')
 
-            if login_click not in ['CLICKED', 'SUBMITTED']:
+            print(f"[LOGIN] Login click result: {login_click}")
+
+            if login_click not in ['CLICKED', 'SUBMITTED', 'ENTER_PRESSED']:
                 return {
                     "success": False, "status": "ERROR",
-                    "detail": "Không tìm được nút Login",
+                    "detail": "Khong tim duoc nut Login",
                     "profile_uuid": profile_uuid, "fb_id": fb_id
                 }
 
@@ -618,16 +909,27 @@ class LoginSkill:
                 if ready == 'complete':
                     break
                 time.sleep(1)
-            time.sleep(2)
+            # Extra wait for FB SPA to render after login redirect
+            time.sleep(4)
 
             status = 'UNKNOWN'
-            for attempt in range(3):
+            for attempt in range(4):
                 status = evaluate(self.LOGIN_RESULT_JS) or 'UNKNOWN'
                 status_clean = status.split(':')[0] if ':' in str(status) else status
-                if status_clean in ['LIVE', 'DIE', 'WRONG_PASS', 'LOCKED', '2FA']:
+                if status_clean in ['LIVE', 'DIE', 'WRONG_PASS', 'LOCKED', '2FA', 'FAILED']:
                     break
-                if attempt < 2:
-                    time.sleep(2)
+                # Fallback: check URL + no login form = LIVE (same logic as FB_STATUS_JS) 
+                if status_clean == 'UNKNOWN':
+                    url_check = evaluate('window.location.href') or ''
+                    has_login_form = evaluate('!!(document.querySelector("#email") || document.querySelector("#pass"))') or False
+                    if ('facebook.com' in url_check and '/login' not in url_check 
+                        and 'login.php' not in url_check and not has_login_form):
+                        status = 'LIVE'
+                        status_clean = 'LIVE'
+                        print(f"[LOGIN] Fallback LIVE detection: URL={url_check[:80]}, no login form")
+                        break
+                if attempt < 3:
+                    time.sleep(3)
 
             status_clean = status.split(':')[0] if ':' in str(status) else status
             detail_part = status.split(':', 1)[1] if ':' in str(status) else ''
@@ -646,6 +948,36 @@ class LoginSkill:
                 result_data["screenshot"] = screenshot_path
                 result_data["screenshot_url"] = f"http://127.0.0.1:8899/screenshots/{os.path.basename(screenshot_path)}"
 
+            # ===== VERIFY + PERSIST COOKIES =====
+            if status_clean in ('LIVE', 'LOGGED_IN'):
+                try:
+                    # Lấy cookies hiện tại để verify
+                    cookies_resp = send_cmd("Network.getCookies", {"urls": ["https://www.facebook.com"]})
+                    cookies = cookies_resp.get('result', {}).get('cookies', [])
+                    has_cuser = any(c.get('name') == 'c_user' for c in cookies)
+                    print(f"[LOGIN] Cookies after login: {len(cookies)} total, c_user={'YES' if has_cuser else 'NO'}")
+                    if not has_cuser:
+                        print(f"[LOGIN] WARNING: No c_user cookie found after LIVE status!")
+                    
+                    # Re-set critical cookies via CDP with explicit persistence
+                    # This forces Chrome to write them to its cookie store
+                    critical_names = {'c_user', 'xs', 'fr', 'datr', 'sb', 'wd', 'presence'}
+                    for ck in cookies:
+                        if ck.get('name') in critical_names:
+                            send_cmd("Network.setCookie", {
+                                "name": ck['name'],
+                                "value": ck['value'],
+                                "domain": ck.get('domain', '.facebook.com'),
+                                "path": ck.get('path', '/'),
+                                "httpOnly": ck.get('httpOnly', False),
+                                "secure": ck.get('secure', True),
+                                "expires": ck.get('expires', time.time() + 86400 * 365),
+                                "sameSite": ck.get('sameSite', 'None')
+                            })
+                    print(f"[LOGIN] Re-set critical cookies for persistence")
+                except Exception as cookie_err:
+                    print(f"[LOGIN] Cookie persist error: {cookie_err}")
+
             return result_data
 
         except Exception as e:
@@ -656,6 +988,20 @@ class LoginSkill:
                 "profile_uuid": profile_uuid, "fb_id": fb_id
             }
         finally:
+            # === GRACEFUL SHUTDOWN ===
+            # CRITICAL: Hidemium's /closeProfile force-kills Chrome process,
+            # preventing cookies from being flushed to disk.
+            # Browser.close() tells Chrome to gracefully save ALL data first.
+            if ws and close_after:
+                try:
+                    # Send Browser.close() - Chrome will flush cookies/storage
+                    # to disk and then exit gracefully
+                    msg_id[0] += 1
+                    ws.send(json.dumps({"id": msg_id[0], "method": "Browser.close"}))
+                    print(f"[LOGIN] Sent Browser.close() for graceful cookie flush")
+                    time.sleep(5)  # Wait for Chrome to finish saving and exit
+                except Exception as bc_err:
+                    print(f"[LOGIN] Browser.close() note: {bc_err}")
             if ws:
                 try:
                     ws.close()
@@ -663,7 +1009,10 @@ class LoginSkill:
                     pass
             if close_after:
                 try:
+                    # Cleanup: tell Hidemium to update internal state
+                    # (Chrome already exited via Browser.close())
                     hidemium.close_browser(profile_uuid)
+                    print(f"[LOGIN] Hidemium cleanup done for {profile_uuid[:20]}")
                 except:
                     pass
 
